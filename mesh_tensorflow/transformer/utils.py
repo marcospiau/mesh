@@ -32,6 +32,8 @@ import re
 import gin
 import gin.tf
 
+import torch
+
 import mesh_tensorflow as mtf
 from mesh_tensorflow.transformer import dataset as transformer_dataset
 from mesh_tensorflow.transformer import learning_rate_schedules
@@ -453,16 +455,18 @@ def tpu_estimator_model_fn(model_type,
         elif isinstance(
             transformer_model,
             (transformer.Bitransformer, transformer.StudentTeacher)):
-          mtf_samples = transformer_model.decode(
+          mtf_samples, scores = transformer_model.decode(
               inputs, variable_dtype=get_variable_dtype())
         else:
           raise ValueError("unrecognized class")
         mtf_samples = mtf.anonymize(mtf_samples)
+        scores = mtf.anonymize(scores)
         inputs = mtf.anonymize(inputs)
         lowering = mtf.Lowering(graph, {mesh: mesh_impl}, autostack=autostack)
         inputs = clean_decodes(lowering.export_to_tf_tensor(inputs))
         outputs = clean_decodes(lowering.export_to_tf_tensor(mtf_samples))
-
+        scores = lowering.export_to_tf_tensor(scores)
+        
         # Detokenize in the graph if supported by vocabulary and accelerator.
         def _maybe_detokenize(ids, vocab):
           if not use_tpu and hasattr(vocab, "decode_tf"):
@@ -474,7 +478,8 @@ def tpu_estimator_model_fn(model_type,
 
         predictions = {
             "inputs": inputs,
-            "outputs": outputs}
+            "outputs": outputs,
+            "scores": scores}
 
       # When exporting a model, we need to communicate to TF-Serving that
       # master variables need to be copied to their slave slice variables.
@@ -938,6 +943,13 @@ def decode(estimator,
         result["inputs"], inputs_vocabulary(vocabulary))
     output_string = _maybe_detokenize(
         result["outputs"], targets_vocabulary(vocabulary))
+
+    scores = result['scores'][0]
+    scores = scores[[6136, 1176]].tolist()
+    scores = [float(score) for score in scores]
+    probs = torch.nn.functional.log_softmax(torch.from_numpy(np.array(scores)))
+    score_string = probs.tolist()[1]
+    output_string = f'{output_string}\t{score_string}'
     decodes.append(output_string)
     if i & (i - 1) == 0:
       # LOG every power of 2.
