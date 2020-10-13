@@ -33,6 +33,8 @@ import torch
 import gin
 import gin.tf
 
+import torch
+
 import mesh_tensorflow as mtf
 from mesh_tensorflow.transformer import dataset as transformer_dataset
 from mesh_tensorflow.transformer import learning_rate_schedules
@@ -1095,7 +1097,6 @@ def decode(estimator,
     probs = torch.nn.functional.log_softmax(torch.from_numpy(np.array(scores)))
     score_string = probs.tolist()[1]
     output_string = f"{output_string}\t{score_string}"
-
     decodes.append(output_string)
     if i & (i - 1) == 0:
       # LOG every power of 2.
