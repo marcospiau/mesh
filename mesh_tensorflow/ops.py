@@ -289,6 +289,9 @@ class LayoutRules(object):
           (self, tensor_shape, mesh_shape))
     return TensorLayout(ret)
 
+  def mesh_dimension_name_to_tensor_dimension_names(self, mesh_dimension_name):
+    return [tdn for tdn, mdn in self._pairs if mdn == mesh_dimension_name]
+
 
 def convert_to_layout_rules(x):
   """Converts input to a LayoutRules.
@@ -1017,12 +1020,33 @@ class MeshImpl(object):
     Args:
       fn: function from tf.Tensors to tf.Tensor or a tuple of tf.Tensors.
       *inputs: list of inputs.  Each input is either a LaidOutTensor or
-        is convertible to a tf.Tensor.
+        has a to_laid_out_tensor method or is convertible to a tf.Tensor.
 
     Returns:
       LaidOutTensor, or a tuple of LaidOutTensors if fn returns a tuple.
     """
     raise NotImplementedError("Slicewise not implemented")
+
+  def slicewise_delay_allreduce(self, fn, *inputs):
+    """If all the arguments are compatible LazyAllreduceSums, then stay lazy.
+
+    Args:
+      fn: function from tf.Tensors to tf.Tensor or a tuple of tf.Tensors.
+      *inputs: list of inputs.  Each input is either a LaidOutTensor or
+        has a to_laid_out_tensor method or is convertibleto a tf.Tensor.
+
+    Returns:
+      LaidOutTensor or LazyAllreduceSum
+    """
+    if compatible_lazy_allreduce_sums(inputs):
+      return LazyAllreduceSum(
+          self,
+          self.slicewise(
+              fn, *[x.laid_out_input for x in inputs]),
+          inputs[0].mesh_axes,
+          add_counter_fn=inputs[0].add_counter_fn)
+    else:
+      return self.slicewise(fn, *inputs)
 
   def Print(self, x, data, message, **kwargs):  # pylint: disable=invalid-name
     """Calls tf.Print.
@@ -1141,6 +1165,9 @@ class MeshImpl(object):
       mesh_axis: an integer
       offset: an integer
       wrap: a boolean. If True, then wrap around. Otherwise, pad with zeros.
+
+    Returns:
+      a LaidOutTensor
     """
     n = self.shape[mesh_axis].size
     source_pcoord = []
@@ -1346,30 +1373,30 @@ class LazyAllreduceSum(object):
         self.add_counter_fn()
     return self._reduced
 
-  def __add__(self, other):
-    """Add to another LazyAllreduceSum.
-
-    Args:
-      other: a LazyAllreduceSum or a LaidOutTensor
-    Returns:
-      a LazyAllreduceSum or a LaidOutTensor
-    """
-    if (isinstance(other, LazyAllreduceSum) and
-        self.mesh_impl == other.mesh_impl and
-        self.mesh_axes == other.mesh_axes):
-      return LazyAllreduceSum(
-          self.mesh_impl,
-          self.mesh_impl.slicewise(
-              tf.add, self.laid_out_input, other.laid_out_input),
-          self.mesh_axes,
-          add_counter_fn=self.add_counter_fn)
-    else:
-      return self.mesh_impl.slicewise(
-          tf.add, self.to_laid_out_tensor(), other.to_laid_out_tensor())
-
   @property
   def slice_shape(self):
     return self.laid_out_input.slice_shape
+
+
+def compatible_lazy_allreduce_sums(xs):
+  """"Are xs all compatible LazyAllreduceSum objects.
+
+  Args:
+    xs: a list
+  Returns:
+    a boolean
+  """
+  if not xs:
+    return False
+  if not all([isinstance(x, LazyAllreduceSum) for x in xs]):
+    return False
+  x = xs[0]
+  for y in xs[1:]:
+    if x.mesh_impl != y.mesh_impl:
+      return False
+    if x.mesh_axes != y.mesh_axes:
+      return False
+  return True
 
 
 def convert_args_to_laid_out_tensors(xs):
@@ -2045,10 +2072,12 @@ class BinaryOpWithBroadcasting(Operation):
     if x2.shape != output.shape:
       laid_out_x2 = mesh_impl.slicewise(
           _expand_dims, laid_out_x2, x2.shape, output.shape)
-    lowering.set_tensor_lowering(
-        self.outputs[0],
-        mesh_impl.slicewise(
-            self._tf_fn, laid_out_x1, laid_out_x2))
+    if self._tf_fn == tf.add:
+      out = mesh_impl.slicewise_delay_allreduce(
+          self._tf_fn, laid_out_x1, laid_out_x2)
+    else:
+      out = mesh_impl.slicewise(self._tf_fn, laid_out_x1, laid_out_x2)
+    lowering.set_tensor_lowering(self.outputs[0], out)
 
 
 def binary_arguments_to_tensors(x1, x2):
@@ -2362,7 +2391,7 @@ def _tf_upscale(x, dim_idx_start, dim_idx_end, xscales):
   trailing_shape = x_shape[dim_idx_end:]
   x = tf.reshape(x, x_shape[:dim_idx_end] + [-1])
   x = _tf_upscale_one_trailing_dim(x)
-  x = tf.reshape(x, x.shape[:-1] + trailing_shape)
+  x = tf.reshape(x, x.shape.as_list()[:-1] + trailing_shape)
 
   return x
 
@@ -2597,6 +2626,7 @@ class SplitOperation(Operation):
             "splittable", [split_dim.name]))
 
   def gradient(self, grad_ys):
+    grad_ys = [g or zeros_like(o) for g, o in zip(grad_ys, self._outputs)]
     return [concat(grad_ys, self._split_dim.name)]
 
   def lower(self, lowering):
@@ -4491,17 +4521,21 @@ class ReshapeOperation(Operation):
 
     laid_out_size = mesh_impl.laid_out_size(old_shape)
 
+    # list of (mesh_axis, tensor_axis) pairs to allsplit after the reshape
+    # typically we do the allsplit before the reshape, to save communication,
+    # but sometimes we need to delay it.
+    allsplit_after_reshape = []
     for mesh_axis in mesh_axes_allsplit:
       tensor_axis = old_shape.cumprod_to_tensor_axis(
           mesh_axis_to_cumprod_new[mesh_axis])
       if tensor_axis is None:
-        # TODO(noam): try to handle this case
-        raise NotImplementedError(
-            "Try first reshaping to insert a new tf dimension,"
-            " then changing layout. input_shape=%s output_shape=%s"
-            % (self.inputs[0].shape, self.outputs[0].shape))
-      slices = mesh_impl.allsplit(slices, mesh_axis, tensor_axis)
-      laid_out_size //= mesh_impl.shape[mesh_axis].size
+        # delay allsplit until after reshape
+        tensor_axis = new_shape.cumprod_to_tensor_axis(
+            mesh_axis_to_cumprod_new[mesh_axis])
+        allsplit_after_reshape.append((mesh_axis, tensor_axis))
+      else:
+        slices = mesh_impl.allsplit(slices, mesh_axis, tensor_axis)
+        laid_out_size //= mesh_impl.shape[mesh_axis].size
     for mesh_axis in mesh_axes_alltoall:
       split_tensor_axis = old_shape.cumprod_to_tensor_axis(
           mesh_axis_to_cumprod_new[mesh_axis])
@@ -4528,12 +4562,14 @@ class ReshapeOperation(Operation):
       lowering.add_counter(
           "allconcat/%s/reshape_op" % mesh_axis, laid_out_size)
     # now reshape the slices
-    old_slice_shape = mesh_impl.slice_shape(old_shape)
     new_slice_shape = mesh_impl.slice_shape(new_shape)
-    if new_slice_shape != old_slice_shape:
-      def reshape_fn(x):
-        return tf.reshape(x, new_slice_shape)
-      slices = mesh_impl.slicewise(reshape_fn, slices)
+    for mesh_axis, tensor_axis in allsplit_after_reshape:
+      new_slice_shape[tensor_axis] *= mesh_impl.shape[mesh_axis].size
+    def reshape_fn(x):
+      return tf.reshape(x, new_slice_shape)
+    slices = mesh_impl.slicewise_delay_allreduce(reshape_fn, slices)
+    for mesh_axis, tensor_axis in allsplit_after_reshape:
+      slices = mesh_impl.allsplit(slices, mesh_axis, tensor_axis)
     lowering.set_tensor_lowering(self.outputs[0], slices)
 
   def gradient(self, grad_ys):
@@ -4894,7 +4930,12 @@ class TopKOperation(Operation):
     def _slicewise_top_k(t):
       t = tf.transpose(
           t, [i for i in range(ndims) if i != reduced_axis] + [reduced_axis])
-      return tf.math.top_k(t, min(self._k_dim.size, reduced_dim_per_shard))
+      if self._k_dim.size == 1:
+        # top_k seems to be slow on TPU - use reduce_max and argmax instead
+        return (tf.expand_dims(tf.math.reduce_max(t, -1), -1),
+                tf.expand_dims(tf.cast(tf.math.argmax(t, -1), tf.int32), -1))
+      else:
+        return tf.math.top_k(t, min(self._k_dim.size, reduced_dim_per_shard))
     values, indices = mesh_impl.slicewise(_slicewise_top_k, lowering.tensors[x])
     if reduced_mesh_axis is not None:
       # indices are now indices within a shard.  Make them global indices.
@@ -4932,7 +4973,7 @@ def top_k(x, reduced_dim, k_dim, name=None):
     values: a Tensor with same type as x.
     indices: a Tensor with dtype tf.int32
   """
-  if k_dim.size < 5:
+  if k_dim.size > 1 and k_dim.size < 5:
     return _iterative_top_k(x, reduced_dim, k_dim, name=name)
   else:
     op = TopKOperation(x, reduced_dim, k_dim, name=name)
@@ -4970,11 +5011,8 @@ def _iterative_top_k(x, reduced_dim, k_dim, name=None):
   return stack(values, k_dim.name, -1), stack(indices, k_dim.name, -1)
 
 
-def _top_1_using_top_k(x, reduced_dim, name=None):
+def top_1(x, reduced_dim, name=None):
   """Max and Argmax.
-
-  Implementation relies on tf.math.top_k, which seems to be slow on TPU,
-  since it sorts.
 
   Args:
     x: a Tensor
@@ -4991,26 +5029,6 @@ def _top_1_using_top_k(x, reduced_dim, name=None):
   return values, indices
 
 
-def top_1(x, reduced_dim, name=None):
-  """Max and Argmax.
-
-  Args:
-    x: a Tensor
-    reduced_dim: a Dimension in x.shape.dims
-    name: an optional string
-  Returns:
-    values: Tensor equal to mtf.reduce_max(x, reduced_dim=reduced_dim)
-    indices: a Tensor with dtype tf.int32
-  """
-  reduced_dim = convert_to_dimension(reduced_dim)
-  with tf.name_scope(name, default_name="top_1"):
-    max_val = reduce_max(x, reduced_dim=reduced_dim)
-    is_max = to_float(equal(x, max_val))
-    pos = mtf_range(x.mesh, reduced_dim, tf.float32)
-    indices = cast(reduce_max(is_max * pos, reduced_dim=reduced_dim), tf.int32)
-    return max_val, indices
-
-
 def argmax(x, reduced_dim, name=None):
   """Compute argmax.
 
@@ -5025,17 +5043,23 @@ def argmax(x, reduced_dim, name=None):
   return top_1(x, reduced_dim, name=name)[1]
 
 
-def sample_with_temperature(x, dim, temperature=1.0, name=None):
-  """Either argmax or random sampling.
+def sample_with_temperature(logits, dim, temperature=1.0, name=None):
+  """Sample from a probability distribution.
+
+  If temperature=0.0, then we compute argmax(logits, dim)
+  If temperature=1.0, then we sample with probability proportional to
+    exp(logits).  So you can pass in the log(probablity) as the logits.
+  `dim` is one the dimension of `logits` which represents the set of choices.
+  The other dimensions of `logits` are treated as batch-dimensions.
 
   Args:
-    x: a Tensor.
-    dim: a Dimension in x.shape.dims
+    logits: a Tensor.
+    dim: a Dimension in logits.shape.dims
     temperature: a float  0.0=argmax 1.0=random
     name: an optional string
 
   Returns:
-    a Tensor with type tf.int32.
+    a Tensor with type tf.int32 and shape (logits.shape - dim)
   """
   dim = convert_to_dimension(dim)
   with tf.name_scope(name, default_name="sample_with_temperature"):
@@ -5044,17 +5068,18 @@ def sample_with_temperature(x, dim, temperature=1.0, name=None):
       # Note: we don't want to generate 0 or 1 because:
       # * -log(-log(0)) is -infinity
       # * -log(-log(1)) is +infinity.
-      # np.finfo(x.dtype.as_numpy_dtype).tiny doesn't work on bfloat16
+      # The numerics may be weird in bfloat16 - use float32.
+      logits = cast(logits, tf.float32)
       tiny_val = 1e-9
       g = -log(-log(
           random_uniform(
-              x.mesh,
-              x.shape,
+              logits.mesh,
+              logits.shape,
               minval=tiny_val,
               maxval=1.,
-              dtype=x.dtype)))
-      x += g * temperature
-    return argmax(x, dim, name)
+              dtype=logits.dtype)))
+      logits += g * temperature
+    return argmax(logits, dim, name)
 
 
 def add(x1, x2, output_shape=None, name=None):
@@ -5162,10 +5187,10 @@ def mtf_slice(x, begin, size, slice_dim_name, name=None):
 
 
 def pad(x, paddings, dim_name, name=None):
-  """Slice operation.
+  """Pad operation.
 
   Args:
-    x: a list of Tensors
+    x: a Tensor
     paddings: list of integers of size 2, padding size before and after for dim.
     dim_name: string, name for the padding dim
     name: an optional string

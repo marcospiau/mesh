@@ -620,11 +620,12 @@ class ReversibleLayerStack(LayerStack):
 
 
 @gin.configurable
-def sublayer_true_layer_norm(x, layer_stack, context):
+def sublayer_true_layer_norm(x, layer_stack, context, epsilon=1e-6):
   """True (aka normal) Normalization."""
+  del layer_stack
   model_dim = context.model.model_dim
   with tf.variable_scope("true_layer_norm"):
-    return mtf.layers.layer_norm(x, model_dim, layer_stack.norm_epsilon)
+    return mtf.layers.layer_norm(x, model_dim, epsilon)
 
 
 @gin.configurable
@@ -768,7 +769,7 @@ class Unitransformer(object):
     off_value = self.label_smoothing / output_vocab_dim.size
     on_value = 1.0 - self.label_smoothing + off_value
     soft_targets = mtf.one_hot(
-        targets,
+        mtf.maximum(targets, 0),
         output_vocab_dim,
         dtype=context.activation_dtype,
         on_value=on_value,
@@ -778,10 +779,9 @@ class Unitransformer(object):
         soft_targets,
         output_vocab_dim,
         z_loss=self.z_loss if context.train else 0.0)
-    weights = mtf.layers.weights_nonzero(
-        targets, dtype=context.activation_dtype)
+    weights = mtf.cast(mtf.greater(targets, 0), context.activation_dtype)
     if self.loss_on_targets_only:
-      weights *= mtf.cast(mtf.logical_not(text2self_inputs_mask(targets)),
+      weights *= mtf.cast(mtf.logical_not(delimited_lm_inputs_mask(targets)),
                           dtype=context.activation_dtype)
     return (mtf.reduce_sum(loss * weights) /
             self.loss_denominator(targets, context.num_microbatches))
@@ -894,6 +894,7 @@ class Unitransformer(object):
       if self.ensemble_dim:
         # The ensembling should not decrease the gradient to each model
         ret /= self.ensemble_dim.size
+      tf.logging.info("loss denominator: %d" % ret)
       return float(ret)
 
   def call_simple(self,
@@ -941,6 +942,9 @@ class Unitransformer(object):
       logits: a Tensor with shape [<batch_dims>, output_vocab_dim]
       loss: an optional Scalar (if compute_loss=True)
     """
+    # Negative ids are used to indicate masked loss during training.
+    # Switch them back to positive numbers.
+    inputs = mtf.abs(inputs)
     batch_dims = inputs.shape.dims[:-1]
     length_dim = inputs.shape.dims[-1]
     length_range = mtf.range(inputs.mesh, length_dim, dtype=tf.int32)
@@ -957,7 +961,7 @@ class Unitransformer(object):
       position_is_default = False
     if self.input_full_attention:
       # The inputs part of each sequence can fully attend within itself.
-      full_attention_region = text2self_inputs_mask(targets)
+      full_attention_region = delimited_lm_inputs_mask(targets)
       # We can include one additional position to the right - the position
       #   where the final EOS of the inputs is read and the first target token
       #   is predicted.
@@ -1099,7 +1103,6 @@ class Unitransformer(object):
     with tf.variable_scope(self.name):
       logits = self._call_internal(context_first_part, shifted_inputs)
       logits_output = logits
-
     del logits
     constant_states = context_first_part.constant_states
     if not has_partial_sequences:
@@ -1509,6 +1512,7 @@ class Bitransformer(object):
              beam_size=1,
              alpha=0.6,
              temperature=0.0,
+             sampling_keep_top_k=-1,
              decode_length_multiplier=1.5,
              decode_length_constant=10,
              max_decode_length=None):
@@ -1524,6 +1528,8 @@ class Bitransformer(object):
       alpha: a floating point value (length bonus for beam search)
       temperature: a value between 0 and 1 (must be 0 if beam_size > 1)
         0.0 means argmax, 1.0 means sample according to predicted distribution.
+      sampling_keep_top_k: a value between 1 and vocab_size used to sample from
+        only the k most likely logits. Set to -1 to sample from all logits.
       decode_length_multiplier: a float
       decode_length_constant: a float
       max_decode_length: an optional integer
@@ -1559,6 +1565,7 @@ class Bitransformer(object):
       return self.decoder.sample_autoregressive(
           partial_sequences,
           temperature=temperature,
+          sampling_keep_top_k=sampling_keep_top_k,
           variable_dtype=variable_dtype,
           encoder_output=encoder_output,
           encoder_sequence_id=encoder_sequence_id,
@@ -1570,6 +1577,9 @@ class Bitransformer(object):
       if temperature != 0:
         raise ValueError(
             "don't know how to beam search with nonzero temperature")
+      if sampling_keep_top_k != -1:
+        raise ValueError(
+            "don't know how to beam search with top-k value other than -1.")
       # beam search
       beam_dim = mtf.Dimension("beam", beam_size)
       ids_shape = mtf.Shape(batch_dims + [beam_dim, decode_length_dim])
@@ -1602,7 +1612,8 @@ class StudentTeacher(object):
                teacher,
                temperature=None,
                fraction_soft=None,
-               teacher_checkpoint=None):
+               teacher_checkpoint=None,
+               initialize_student_weights=False):
     """Create a StudentTeacher.
 
     Args:
@@ -1616,12 +1627,16 @@ class StudentTeacher(object):
         training.
       teacher_checkpoint: a string, the path to the teacher checkpoint that we
         wish to use. Required only when training.
+      initialize_student_weights: a boolean, if true then initialize any
+        of the student weights whose name matches those in the teacher
+        checkpoint.
     """
     self.student = student
     self.teacher = teacher
     self.temperature = temperature
     self.fraction_soft = fraction_soft
     self.teacher_checkpoint = teacher_checkpoint
+    self.initialize_student_weights = initialize_student_weights
 
   def call_simple(self,
                   inputs,
@@ -1691,8 +1706,7 @@ class StudentTeacher(object):
         z_loss=z_loss)
 
     # Ignore losses from padding regions.
-    weights = mtf.layers.weights_nonzero(
-        targets, dtype=variable_dtype.activation_dtype)
+    weights = mtf.cast(mtf.greater(targets, 0), soft_loss.dtype)
     soft_loss = (mtf.reduce_sum(soft_loss * weights) /
                  self.student.loss_denominator(targets, num_microbatches))
 
@@ -1723,7 +1737,7 @@ class StudentTeacher(object):
         raise ValueError("unrecognized class")
 
   def initialize(self):
-    """Initialize the teacher model from the checkpoint.
+    """Initialize the teacher and maybe student model from the checkpoint.
 
     This function will be called after the graph has been constructed.
     """
@@ -1732,6 +1746,31 @@ class StudentTeacher(object):
       return
     vars_to_restore = tf.get_collection(
         tf.GraphKeys.GLOBAL_VARIABLES, scope="teacher")
+
+    if self.initialize_student_weights:
+      student_vars_to_restore = tf.get_collection(
+          tf.GraphKeys.GLOBAL_VARIABLES, scope="student")
+      # See what variables exist in the checkpoint
+      ckpt_vars = set([
+          name for name, _ in tf.train.list_variables(self.teacher_checkpoint)])
+      student_load_dict = {}
+      # Loop over all student variables and see if any can be loaded from ckpt
+      for var in student_vars_to_restore:
+        var_name = var.name[len("student/"):].split(":")[0]
+        if var_name in ckpt_vars:
+          student_load_dict[var_name] = var
+        else:
+          tf.logging.info("Student variable not found in ckpt: {}".format(
+              var_name))
+
+      loaded_vars = set(student_load_dict.keys())
+      tf.logging.info("Variables not restored from ckpt for student: {}".format(
+          ckpt_vars - loaded_vars))
+
+      tf.train.init_from_checkpoint(
+          self.teacher_checkpoint, student_load_dict)
+
+    # Initialize teacher weights
     tf.train.init_from_checkpoint(
         self.teacher_checkpoint,
         {v.name[len("teacher/"):].split(":")[0]: v for v in vars_to_restore})
@@ -1911,7 +1950,7 @@ def _round_up_to_multiple(n, divisor):
   return n + -n % divisor
 
 
-def text2self_inputs_mask(ids, eos_id=1):
+def delimited_lm_inputs_mask(ids, eos_id=1):
   """Binary mask indicating which parts of the ids represent the inputs.
 
   Assumes that the ids consist of packed sequences where each example is
@@ -1981,7 +2020,7 @@ class VocabEmbedding(object):
   """A class to go from vocab ids to model states and model states to logits."""
 
   def __init__(self, mesh, vocab_dim, output_dim, variable_dtype, name,
-               ensemble_dim):
+               ensemble_dim, scale_variable_like_classifier_weights=False):
     """Embedding for the vocabulary.
 
     Most of the arguments get passed to `mtf.layers.embedding_weights`.
@@ -1993,23 +2032,36 @@ class VocabEmbedding(object):
       variable_dtype: a mtf.VariableDType
       name: a string
       ensemble_dim: a mtf.Dimension
+      scale_variable_like_classifier_weights: a boolean
     """
     self._vocab_dim = vocab_dim
     self._output_dim = output_dim
+    self._scale_variable_like_classifier_weights = (
+        scale_variable_like_classifier_weights)
+    if self._scale_variable_like_classifier_weights:
+      initializer = tf.random_normal_initializer(
+          stddev=self._output_dim.size ** -0.5)
+    else:
+      initializer = None
     self._embedding_weights = mtf.layers.embedding_weights(
         mesh=mesh,
         vocab_dim=vocab_dim,
         output_dim=output_dim,
         variable_dtype=variable_dtype,
         name=name,
-        ensemble_dim=ensemble_dim)
+        ensemble_dim=ensemble_dim,
+        initializer=initializer)
 
   def ids_to_embedding(self, ids):
-    return mtf.gather(self._embedding_weights, ids, self._vocab_dim)
+    ret = mtf.gather(self._embedding_weights, ids, self._vocab_dim)
+    if self._scale_variable_like_classifier_weights:
+      ret *= self._output_dim.size ** 0.5
+    return ret
 
   def hidden_to_logits(self, hidden, context):
     del context
-    hidden *= self._output_dim.size**-0.5
+    if not self._scale_variable_like_classifier_weights:
+      hidden *= self._output_dim.size**-0.5
     return mtf.einsum([hidden, self._embedding_weights],
                       reduced_dims=[self._output_dim])
 
