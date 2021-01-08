@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The Mesh TensorFlow Authors.
+# Copyright 2021 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -256,20 +256,12 @@ class SelfAttention(transformer.TransformerLayer):
     if self.shared_kv:
       k = kv
       v = kv
-    if self.attention_func == "hybrid":
-      o = attention.hybrid_attention(
-          q, k, v, context, memory_length, self.kv_dim, self.kv_dim,
-          self.compute_bias(context, memory_position, x,
-                            params.query_heads_dims, q),
-          **self.attention_kwargs_from_context(context))
-    else:
-      o = attention.attention(
-          q, k, v, memory_length, self.kv_dim, self.kv_dim,
-          self.compute_bias(context, memory_position, x,
-                            params.query_heads_dims, q),
-          context=context,
-          **self.attention_kwargs_from_context(context))
-
+    o = self.attention_fn(
+        q, k, v, context=context, memory_length_dim=memory_length,
+        key_dim=self.kv_dim, value_dim=self.kv_dim,
+        bias=self.compute_bias(context, memory_position, x,
+                               params.query_heads_dims, q),
+        **self.attention_kwargs_from_context(context))
     attention_output_shape = self.expected_attention_output_shape(x, params)
     attention_output = params.compute_output(
         o, output_shape=attention_output_shape)
@@ -377,6 +369,13 @@ class SelfAttention(transformer.TransformerLayer):
 
   def max_relative_position(self, context):
     return None
+
+  @property
+  def attention_fn(self):
+    if self.attention_func == "hybrid":
+      return attention.hybrid_attention
+    else:
+      return attention.attention
 
 
 @gin.configurable
@@ -633,7 +632,7 @@ def relative_position_spans(context, num_sentinels=gin.REQUIRED):
   Args:
     context: a Context
     num_sentinels: an integer.  Should have the same value as
-       sentencepiece_vocabulary.SentencePieceVocabulary.extra_ids
+       SentencePieceVocabulary.extra_ids
   Returns:
     a Tensor
   """
@@ -720,7 +719,7 @@ def enc_dec_attention_bias(layer,
 
 @gin.configurable
 def enc_dec_attention(self_attention_layer, memory_antecedent, context, x,
-                      losses):
+                      losses, attention_fn=attention.attention):
   """Multi-head attention over the encoder outputs."""
   memory_input_dim = memory_antecedent.shape[-1]
   if memory_input_dim != context.model.model_dim:
@@ -745,7 +744,7 @@ def enc_dec_attention(self_attention_layer, memory_antecedent, context, x,
   bias = enc_dec_attention_bias(self_attention_layer,
                                 context,
                                 params.query_heads_dims)
-  a = attention.attention(
+  a = attention_fn(
       q, k, v, memory_length, self_attention_layer.kv_dim,
       self_attention_layer.kv_dim, bias,
       context=context,
@@ -772,7 +771,12 @@ class EncDecAttention(SelfAttention):
   def call(self, context, x, losses=None):
     """Call the layer."""
     return enc_dec_attention(self, self._get_memory_antecedent(context),
-                             context, x, losses)
+                             context, x, losses,
+                             attention_fn=self.attention_fn)
+
+  @property
+  def attention_fn(self):
+    return attention.attention
 
 
 @gin.configurable
@@ -1543,8 +1547,161 @@ class BranchedEncDecAttention(BranchedSelfAttention):
                              context, x, losses)
 
 
+class Conv1D(transformer.TransformerLayer):
+  """Parent class for convolutional layers for common decoding logics.
+
+  When convolutional layers are used in the decoder, the incremental decoding
+  requires common features such as storing and accessing the recurrent state
+  information. These features do not depend on the specifics of the
+  convolutional layer (e.g., depthwise convolution, lightweight) as long as they
+  have the fixed receptive field defined by the filter size. This class
+  provides the methods for such features.
+  """
+
+  def record_states_first_part_mode(self,
+                                    context,
+                                    x,
+                                    filter_size,
+                                    length_dim_name="length"):
+    """Record the states during the first part mode.
+
+    l: current layer index
+    k: convolution filter size
+    x(l): input tensor to layer `l` for the first_part mode with the shape
+      [<batch_dims>, length, d_model].
+
+    The first_part mode is called once before the incremental mode is called for
+    the actual decoding process. The purpose is to set the recurrent states in
+    context.states, which are accessed during the incremental mode via
+    context.get_states. There are two cases depending on partial sequences are
+    present or not.
+
+    1) with partial sequences
+    When partial sequences are present, we decode from the position after the
+    partial sequence, but we need to use the information contained in the
+    partial sequence.
+
+    x(l) = [x1, x2, 0, 0, 0]
+    context.initial_position = 2 (the actual decoding should start from index
+    2).
+    Then we record the state = [0, x1, x2]. If partial sequences are shorter
+    than the filter size, we zero pad from the left.
+
+    2) Without partial sequences
+    x(l) = [0, 0, 0, 0, 0]
+    context.initial_position = 0
+    Then we record the state = [0, 0, 0]
+
+    These two cases can be handled with the following pseudocode. Let
+    i = context.initial_position.
+    state = x[:, i-filter_size:i, :] and store this as state.
+
+    Equivalently we can shift x by filter_size and slice
+    shifted_x = shift(x, length_dim)
+    state = shifted_x[:, i:i + filter_size, :]
+
+    Args:
+      context: a transformer.Context.
+      x: a Tensor.
+      filter_size: an intger - convolution filter size.
+      length_dim_name: a string - a dimension name for the length mtf.Dimension.
+    """
+    length_dim = x.shape.dims[-2]
+
+    # Slice shifted_x[:, i:i + self.filter_size, :]
+    filter_dim = mtf.Dimension(length_dim_name, filter_size)
+    indices = mtf.range(x.mesh, filter_dim, dtype=tf.int32)
+    indices = context.initial_position + indices
+
+    # Assumes that x.shape = [<batch_dims>, length_dim, model_dim]
+    output_shape = mtf.Shape(x.shape.dims[:-2] + [filter_dim] +
+                             x.shape.dims[-1:])
+    shifted_x = mtf.shift(x, filter_size, length_dim, wrap=False)
+    state = mtf.gather(
+        shifted_x, indices, length_dim, output_shape=output_shape)
+    context.record_new_states([state])
+
+  def record_states_incremental_mode(self, context, x, filter_size,
+                                     length_dim_name="length"):
+    """Record the states during the first part mode.
+
+    l: current layer index
+    t: current decoding time step
+    k: convolution filter size
+    x(l, t): input vector to layer `l` at time step `t` for the incremental
+      mode with the shape [<batch_dims>, d_model].
+
+    During the incremental mode, the input to the conv layer x(l, t) does not
+    have the length dim because the input vector x corresponds to the current
+    decoding time step. We want to restore the input to the current layer in the
+    previous time steps (stored in the context.states) and combine with the
+    input at the current time step. This method does the following.
+
+    1) Restore the states: [x(l, t-k), ..., x(l, t-1)]
+    2) Combine with the current input: [x(l, t-k+1), ..., x(l, t-1), x(l, t)]
+    3) Store the new state and return it to be used as an input to the conv
+    layer.
+
+    It is important to note that the state being recorded is not used by the
+    next layer; it is used by the same layer but at the future time steps.
+
+    Args:
+      context: a transformer.Context.
+      x: a Tensor.
+      filter_size: an intger - convolution filter size.
+      length_dim_name: a string - a dimension name for the length mtf.Dimension.
+
+    Returns:
+      x: a Tensor of shape [<batch_dims>, filter_size, d_model].
+    """
+    # Augment x with the states
+    filter_dim = mtf.Dimension(length_dim_name, filter_size)
+    input_state = context.get_states(1)[0]
+
+    position = mtf.constant(
+        x.mesh,
+        filter_size - 1,  # Always use the last position.
+        shape=mtf.Shape(x.shape.dims[:-1]),  # Pick out batch dims.
+        dtype=tf.int32)
+
+    # [batch, d_model] -> [batch, filter, d_model]
+    x = self.update_state(
+        input_state, x, position, filter_dim, dtype=context.activation_dtype)
+
+    # new state include the input for [t-filter, ..., t] steps.
+    context.record_new_states([x])
+    return x
+
+  def update_state(self, old_state, x, position, filter_dim, dtype):
+    """Augment the current input to the old state.
+
+    [x(l, t-k), ..., x(l, t-1)], x(l, t) ->
+    [x(l, t-k+1), ..., x(l, t-1), x(l, t)]
+
+    Args:
+      old_state: a Tensor of shape [<batch_dims>, filter_size, d_model]
+      x: a Tensor of shape [<batch_dims>, d_model]
+      position: a Tensor of shape [<batch_dims>]
+      filter_dim: an mtf.Dimension corresponding to the filter size.
+      dtype: a mtf.VariableDType
+
+    Returns:
+      new_state: a Tensor of shape [<batch_dims>, filter_size, d_model].
+    """
+    # [<batch_dims>, length, d_model]
+    shifted_state = mtf.shift(old_state, -1, filter_dim, wrap=False)
+
+    # [<batch_dims>, length]
+    one_hot = mtf.one_hot(position, filter_dim, dtype=dtype)
+
+    # [<batch_dims>, length, d_model]
+    shifted_x = one_hot * x
+    new_state = shifted_state + shifted_x
+    return new_state
+
+
 @gin.configurable
-class Conv1DLayer(transformer.TransformerLayer):
+class Conv1DLayer(Conv1D):
   """1D convolution over sequence length with model dim as channels.
 
   One caveat is that this layer does nothing to stop information from bleeding
@@ -1567,31 +1724,50 @@ class Conv1DLayer(transformer.TransformerLayer):
 
   def call(self, context, x, losses=None):
     """Call the layer."""
-    if context.mode == "incremental":
-      # TODO(mmatena): Implement.
-      raise NotImplementedError(
-          "incremental mode for Conv1DLayer not implemented yet.")
+    if context.mode == "first_part":
+      self.record_states_first_part_mode(context, x, self.filter_size)
 
-    # Mask padding.
-    mask = mtf.cast(mtf.not_equal(context.inputs, 0), context.activation_dtype)
-    x *= mask
+    if context.mode == "incremental":
+      x = self.record_states_incremental_mode(context, x, self.filter_size)
+      padding = "VALID"
+    else:
+      # The first_part mode also needs masking because it may have partial
+      # sequences.
+      mask = mtf.cast(
+          mtf.not_equal(context.inputs, 0), context.activation_dtype)
+      x *= mask
+      padding = "SAME"
 
     model_dim = x.shape.dims[-1]
+    input_dim = mtf.Dimension("input_dim", model_dim.size)
+    x = mtf.replace_dimensions(x, model_dim, input_dim)
     output_dim = mtf.Dimension(model_dim.name, self._output_size)
     output = mtf.layers.conv1d(
         x,
         output_dim=output_dim,
         filter_size=self._filter_size,
-        padding="SAME",
+        padding=padding,
         filter_initializer=tf.glorot_uniform_initializer())
+
+    if context.mode == "incremental":
+      filter_dim = mtf.Dimension("length", self.filter_size)
+
+      # [batch_dims, 1, output_dim] -> [batch_dims, output_dim]
+      output = mtf.reduce_sum(
+          output, reduced_dim=mtf.Dimension(filter_dim.name, 1))
+
     if self._activation != "linear":
       activation_fn = getattr(mtf, self._activation)
       output = activation_fn(output)
     return output
 
+  @property
+  def filter_size(self):
+    return self._filter_size
+
 
 @gin.configurable
-class SeparableConv1DLayer(transformer.TransformerLayer):
+class SeparableConv1DLayer(Conv1D):
   """1D separable convolution over sequence length with model dim as channels.
 
   One caveat is that this layer does nothing to stop information from bleeding
@@ -1635,18 +1811,19 @@ class SeparableConv1DLayer(transformer.TransformerLayer):
   def call(self, context, x, losses=None, all_kernel_wts=None):
     """Call the layer."""
 
-    if context.mode == "incremental":
-      # TODO(mmatena): Implement.
-      raise NotImplementedError(
-          "incremental mode for Conv1DLayer not implemented yet.")
+    if context.mode == "first_part":
+      self.record_states_first_part_mode(context, x, self.filter_size)
 
-    # Mask padding.
-    # TODO(karishmamalkan): Change the inputs_for_mask_creation to use decoder
-    # when using with decoder
-    inputs_for_mask_creation = context.inputs
-    mask = mtf.cast(
-        mtf.not_equal(inputs_for_mask_creation, 0), context.activation_dtype)
-    x *= mask
+    if context.mode == "incremental":
+      x = self.record_states_incremental_mode(context, x, self.filter_size)
+    else:
+      # Mask padding.
+      # TODO(karishmamalkan): Change the inputs_for_mask_creation to use decoder
+      # when using with decoder
+      inputs_for_mask_creation = context.inputs
+      mask = mtf.cast(
+          mtf.not_equal(inputs_for_mask_creation, 0), context.activation_dtype)
+      x *= mask
 
     model_dim = x.shape.dims[-1]
     output_dim = mtf.Dimension(model_dim.name, self._output_size)
@@ -1662,10 +1839,21 @@ class SeparableConv1DLayer(transformer.TransformerLayer):
         ._pointwise_filter_initializer_scale,
         use_bias=True,
         kernel_depth_weights=all_kernel_wts)
+
+    if context.mode == "incremental":
+      filter_dim = mtf.Dimension("length", self.filter_size)
+      # Drop unnecessary portion [batch, length, d_model] -> [batch, d_model]
+      # Only the last sequence position is relevant.
+      output = mtf.gather(output, [self.filter_size - 1], filter_dim)
+
     if self._activation != "linear":
       activation_fn = getattr(mtf, self._activation)
       output = activation_fn(output)
     return output
+
+  @property
+  def filter_size(self):
+    return self._max_relative_pos - self._min_relative_pos + 1
 
 
 @gin.configurable

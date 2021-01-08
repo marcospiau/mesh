@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The Mesh TensorFlow Authors.
+# Copyright 2021 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,7 +20,9 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import functools
 import re
+
 import gin
 from mesh_tensorflow import layers
 from mesh_tensorflow import ops_with_redefined_builtins as mtf
@@ -364,7 +366,8 @@ class AdafactorOptimizer(Optimizer):
     return adafactor_decay_rate_pow(0.8)
 
   def _learning_rate_default(self, multiply_by_parameter_scale):
-    learning_rate = tf.minimum(tf.math.rsqrt(step_num() + 1.0), 0.01)
+    step_num = tf.cast(tf.train.get_or_create_global_step(), tf.float32)
+    learning_rate = tf.minimum(tf.math.rsqrt(step_num + 1.0), 0.01)
     if (not multiply_by_parameter_scale
         and not layers.unit_scaling_convention()):
       learning_rate *= 0.05
@@ -384,19 +387,21 @@ def adafactor_decay_rate_adam(beta2):
   return decay
 
 
-def adafactor_decay_rate_pow(exponent):
+@gin.configurable
+def adafactor_decay_rate_pow(exponent, offset=0):
   """Second moment decay rate where memory-length grows as step_num^exponent.
+
+  For fine-tuning, you may want to gin-configure offset to equal the starting
+  step-number for the fine-tuning phase.
 
   Args:
     exponent: a float between 0 and 1
+    offset: an integer (the starting step number)
   Returns:
     a scalar
   """
-  return 1.0 - tf.pow((step_num() + 1.0), -exponent)
-
-
-def step_num():
-  return tf.cast(tf.train.get_or_create_global_step(), tf.float32)
+  step_num = tf.cast(tf.train.get_or_create_global_step() - offset, tf.float32)
+  return 1.0 - tf.pow((step_num + 1.0), -exponent)
 
 
 def adafactor_optimizer_from_hparams(hparams, lr):
@@ -430,3 +435,164 @@ def adafactor_optimizer_from_hparams(hparams, lr):
 
 def reduce_rms(x):
   return mtf.sqrt(mtf.reduce_mean(mtf.square(x)))
+
+
+# Workaround by copying this over
+# Note: Importing this from transformers gives some circular import problems.
+@gin.configurable
+def product_learning_rate(step,
+                          total_train_steps,
+                          factors=gin.REQUIRED,
+                          offset=0):
+  """Learning rate is the product of one or more factors.
+
+  Takes a list of factors which are either numbers or learning-rate functions
+  each taking step and total_train_step arguments.
+
+  If `offset` is nonzero, then subtract offset from the step and from
+  total_train_steps before computing the learning rate.
+
+  Args:
+    step: a tf.Scalar
+    total_train_steps: a number
+    factors: a list of numbers and/or functions
+    offset: an optional float
+
+  Returns:
+    a tf.Scalar, the learning rate for the step.
+  """
+  ret = 1.0
+  for f in factors:
+    ret *= f(step - offset, total_train_steps - offset) if callable(f) else f
+  return ret
+
+
+@gin.configurable
+def compute_lr_for_step(schedules, learning_rate,
+                        train_steps=524288):
+  """Get actual LR for step."""
+  actual_lr_rates = []
+  for lr_schedule in schedules:
+    if lr_schedule is None:
+      actual_lr_rates.append(learning_rate)
+    else:
+      converted_schedule = functools.partial(
+          product_learning_rate, factors=lr_schedule)
+      converted_schedule = functools.partial(
+          converted_schedule, total_train_steps=train_steps)
+      if callable(converted_schedule):
+        # the following happens on CPU since TPU can't handle summaries.
+        with mtf.utils.outside_all_rewrites():
+          converted_schedule = converted_schedule(
+              step=tf.train.get_global_step())
+          tf.summary.scalar("alt_learning_rate", converted_schedule)
+      actual_lr_rates.append(converted_schedule)
+  return actual_lr_rates
+
+
+@gin.configurable
+class AdafactorWithMultiLRSchedule(AdafactorOptimizer):
+  """Adafactor with Multiple LR schedule."""
+
+  def __init__(self,
+               variable_search=None,
+               alt_lr_schedules=None,
+               **kwargs
+               ):
+    """Construct a new Adafactor optimizer.
+
+    See class comment.
+
+    Args:
+      variable_search: list of regex strings to use alt learning rate.
+      alt_lr_schedules: list of learning_rate_schedules
+      **kwargs: Adafactor keyword args
+
+    Raises:
+      ValueError: if absolute_update_scale and relative_update_scale_fn are both
+        present or both absent.
+    """
+    super(AdafactorWithMultiLRSchedule, self).__init__(
+        **kwargs
+    )
+    self.variable_search = variable_search
+    self.alt_lr_schedules = alt_lr_schedules
+
+  def apply_grad(self, grad, var):
+    if self.alt_lr_schedules is None or self.variable_search is None:
+      return super(AdafactorWithMultiLRSchedule, self).apply_grad(grad, var)
+
+    actual_lr_rates = compute_lr_for_step(self.alt_lr_schedules,
+                                          self._learning_rate,
+                                          )
+    # Modify learning rate for exception variables
+    for idx, variable_search in enumerate(self.variable_search):
+      if re.search(variable_search, var.name) is not None:
+        # finds variable in LR schedule
+        old_lr = self._learning_rate
+        # get n-th learning rate schedule
+        self._learning_rate = actual_lr_rates[idx]
+        assignments = super(AdafactorWithMultiLRSchedule,
+                            self).apply_grad(grad, var)
+        self._learning_rate = old_lr
+      else:
+        assignments = super(AdafactorWithMultiLRSchedule,
+                            self).apply_grad(grad, var)
+    return assignments
+
+
+@gin.configurable
+class AdamWithMultiLRSchedule(AdamWeightDecayOptimizer):
+  """An  Adam optimizer that includes "correct" L2 weight decay.
+
+  Adam optimizer that is able to processes multiple learning rate schedules
+  for different variables within the optimizer class itself. This function
+  takes in a list of variables to search and a list of corresponding
+  alt lr schedules.
+
+  The original variables are processed with the original learning rate
+  controlled from outside the loop.
+
+  Learning rate schedule should use the product learning rate.
+  """
+
+  def __init__(self,
+               variable_search=None,
+               alt_lr_schedules=None,
+               **kwargs
+               ):
+    """Adam LR with multi LR schedule.
+
+    Args:
+      variable_search: list of regex strings to use alt learning rate.
+      alt_lr_schedules: list of learning_rate_schedules
+      **kwargs: Adam keyword args
+    """
+    super(AdamWithMultiLRSchedule, self).__init__(
+        **kwargs
+    )
+    self.variable_search = variable_search
+    self.alt_lr_schedules = alt_lr_schedules
+
+  def apply_grad(self, grad, var):
+    if self.alt_lr_schedules is None or self.variable_search is None:
+      return super(AdamWithMultiLRSchedule, self).apply_grad(grad, var)
+
+    actual_lr_rates = compute_lr_for_step(self.alt_lr_schedules,
+                                          self.learning_rate
+                                          )
+
+    # Modify learning rate for exception variables
+    for idx, variable_search in enumerate(self.variable_search):
+      if re.search(variable_search, var.name) is not None:
+        # finds variable in LR schedule
+        old_lr = self.learning_rate
+        # get n-th learning rate schedule
+        self.learning_rate = actual_lr_rates[idx]
+        assignments = super(AdamWithMultiLRSchedule,
+                            self).apply_grad(grad, var)
+        self.learning_rate = old_lr
+      else:
+        assignments = super(AdamWithMultiLRSchedule,
+                            self).apply_grad(grad, var)
+    return assignments

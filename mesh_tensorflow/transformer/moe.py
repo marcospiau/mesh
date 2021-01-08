@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The Mesh TensorFlow Authors.
+# Copyright 2021 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -420,6 +420,18 @@ def transformer_moe_layer_v1(
                                  num_groups_dim, expert_capacity_dim, input_dim
                              ]))
 
+  # Extra reshape reduces communication cost for model-parallel versions.
+  # For model-parallel versions, this reshape causes an mtf.slice and for non-
+  # model-parallel versions, this has no effect.
+  d_model_split_dim = mtf.Dimension("d_model_split", input_dim.size)
+  expert_inputs = mtf.reshape(
+      expert_inputs,
+      mtf.Shape([
+          outer_batch_dim, experts_dim, batch_dim_unsplit, expert_capacity_dim,
+          d_model_split_dim
+      ]))
+
+  # Split over batch -> split over experts
   expert_inputs = mtf.reshape(
       expert_inputs,
       mtf.Shape([
@@ -446,6 +458,17 @@ def transformer_moe_layer_v1(
         reduced_dims=hidden.shape.dims[-1:], variable_dtype=variable_dtype,
         name=layer_name)
 
+    # Extra reshape reduces communication cost for model-parallel versions.
+    # For model-parallel versions, this reshape causes an mtf.slice and for non-
+    # model-parallel versions, this has no effect.
+    expert_output = mtf.reshape(
+        expert_output,
+        mtf.Shape([
+            outer_batch_dim, experts_dim_unsplit, num_groups_dim,
+            expert_capacity_dim, d_model_split_dim
+        ]))
+
+    # Split over experts -> split over batch
     expert_output = mtf.reshape(
         expert_output,
         mtf.Shape([
@@ -923,6 +946,8 @@ def _rand_1_gating(
 
   if policy == "argmax" or policy == "input_dropout" or policy == "input_jitter":
     expert_gate, expert_index = mtf.top_1(raw_gates, reduced_dim=experts_dim)
+    if train:
+      mtf.scalar_summary("expert_gate", mtf.reduce_mean(expert_gate))
   elif policy == "sample":
     expert_index = mtf.sample_with_temperature(
         gate_logits, experts_dim, temperature=hparams.moe_rand_1_temperature)
@@ -981,6 +1006,12 @@ def _rand_1_gating(
       mtf.less(position_in_expert, expert_capacity_float),
       dtype=raw_gates.dtype)
   expert_mask_flat = mtf.reduce_sum(expert_mask, reduced_dim=experts_dim)
+
+  if train:
+    total_routed = mtf.reduce_sum(expert_mask_flat)
+    importance = mtf.cast(importance, dtype=total_routed.dtype)
+    mtf.scalar_summary("fraction_routed",
+                       total_routed / mtf.reduce_sum(importance))
 
   # Mask out the experts that have overflowed expert capacity. Sparsify the
   # expert_gate.
@@ -1073,16 +1104,16 @@ def _top_2_gating(
   """
   group_size_dim, unused_input_dim = inputs.shape.dims[-2:]
 
+  # The internals of this function run in float32.
+  # bfloat16 seems to reduce quality.
+  gate_inputs = mtf.to_float(inputs)
+
   raw_gates = mtf.layers.dense(
-      inputs, experts_dim, use_bias=False,
+      gate_inputs, experts_dim, use_bias=False,
       expert_dims=outer_expert_dims,
       variable_dtype=variable_dtype,
       name=name)
   raw_gates = mtf.softmax(raw_gates, experts_dim)
-
-  # The internals of this function run in float32.
-  #   bfloat16 seems to reduce quality.
-  raw_gates = mtf.to_float(raw_gates)
 
   expert_capacity_f = float(expert_capacity_dim.size)
 

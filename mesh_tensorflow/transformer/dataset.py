@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The Mesh TensorFlow Authors.
+# Copyright 2021 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -119,6 +119,7 @@ def pack_or_pad(
     a tf.data.Dataset where all features have fixed shape [length].
   """
   feature_keys = set(feature_keys or tf.data.get_output_shapes(dataset).keys())
+
   if pack:
     dataset = pack_dataset(dataset, length=length, keys=feature_keys)
   # Pad/trim length of each example to length.
@@ -127,6 +128,7 @@ def pack_or_pad(
   if ensure_eos:
     eos_keys = feature_keys if isinstance(ensure_eos, bool) else ensure_eos
     dataset = ensure_dataset_eos(dataset, eos_keys)
+
   return dataset
 
 
@@ -695,16 +697,21 @@ def _pack_with_custom_ops(dataset, keys, length):
   elif len(keys) == 2:
     k1, k2 = keys
   else:
-    raise ValueError("must have 1 or 2 keys")
-  def map_fn_custom(x):
+    raise ValueError(f"Packing op requires 1 or 2 keys. Got {len(keys)}")
+
+  def custom_pack_batch(x):
     """Map-function."""
-    (k1_packed, k1_segmengation, k1_position,
+    (k1_packed, k1_segmentation, k1_position,
      k2_packed, k2_segmentation, k2_position) = (
          pack_sequences_ops.pack_sequences2(
-             x[k1], x[k2], length[k1], length[k2]))
+             # cast to int64 for compatibility with custom ops
+             tf.cast(x[k1], tf.int64),
+             tf.cast(x[k2], tf.int64),
+             length[k1],
+             length[k2]))
     packed = {
         k1: k1_packed,
-        k1 + "_segmentation": k1_segmengation,
+        k1 + "_segmentation": k1_segmentation,
         k1 + "_position": k1_position,
     }
     if len(keys) == 2:
@@ -713,9 +720,14 @@ def _pack_with_custom_ops(dataset, keys, length):
           k2 + "_segmentation": k2_segmentation,
           k2 + "_position": k2_position,
       })
+
+    # cast back to int32
+    for k, v in packed.items():
+      packed[k] = tf.cast(v, tf.int32)
+
     return packed
-  dataset = dataset.map(map_fn_custom,
-                        num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  dataset = dataset.map(
+      custom_pack_batch, num_parallel_calls=tf.data.experimental.AUTOTUNE)
   dataset = dataset.unbatch()
   return dataset
 
