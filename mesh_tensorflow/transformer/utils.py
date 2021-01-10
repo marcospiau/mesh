@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The Mesh TensorFlow Authors.
+# Copyright 2021 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -45,6 +45,7 @@ import six
 import tensorflow.compat.v1 as tf
 import tensorflow_datasets as tfds
 
+from tensorflow.core.protobuf import rewriter_config_pb2  # pylint: disable=g-direct-tensorflow-import
 from tensorflow.python.ops import resources  # pylint: disable=g-direct-tensorflow-import
 from tensorflow.python.tpu import tpu_config  # pylint: disable=g-direct-tensorflow-import
 from tensorflow.python.tpu import tpu_estimator  # pylint: disable=g-direct-tensorflow-import
@@ -69,7 +70,7 @@ def _filter_features(ex):
   return {k: v for k, v in ex.items() if k in _MODEL_FEATURES}
 
 
-def parse_gin_defaults_and_flags():
+def parse_gin_defaults_and_flags(skip_unknown=False, finalize_config=True):
   """Parses all default gin files and those provided via flags."""
   # Register .gin file search paths with gin
   for gin_file_path in FLAGS.gin_location_prefix:
@@ -77,8 +78,12 @@ def parse_gin_defaults_and_flags():
   # Set up the default values for the configurable parameters. These values will
   # be overridden by any user provided gin files/parameters.
   gin.parse_config_file(
-      pkg_resources.resource_filename(__name__, _DEFAULT_CONFIG_FILE))
-  gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
+      pkg_resources.resource_filename(__name__, _DEFAULT_CONFIG_FILE),
+      skip_unknown=skip_unknown)
+  gin.parse_config_files_and_bindings(
+      FLAGS.gin_file, FLAGS.gin_param,
+      skip_unknown=skip_unknown,
+      finalize_config=finalize_config)
 
 
 # TODO(noam): maybe add gin-config to mtf.get_variable so we can delete
@@ -138,6 +143,15 @@ def targets_vocabulary(vocabulary):
 def separate_vocabularies(inputs=gin.REQUIRED, targets=gin.REQUIRED):
   """Gin-configurable helper function to generate a tuple of vocabularies."""
   return (inputs, targets)
+
+
+@gin.configurable
+def init_checkpoint_variable_mapping(name, mapping_fn=None):
+  """Maps from varaible name in graph to variable name in checkpoint."""
+  if mapping_fn:
+    return mapping_fn(name)
+  else:
+    return name
 
 
 # TODO(katherinelee): Update layout_rules string when noam updates the
@@ -290,6 +304,7 @@ def tpu_estimator_model_fn(model_type,
                            score_in_predict_mode=False,
                            variable_filter=None,
                            init_checkpoint=None,
+                           init_variable_filter="",
                            ensemble_inputs=None,
                            mesh_devices=None,
                            model_info_file=None,
@@ -330,6 +345,9 @@ def tpu_estimator_model_fn(model_type,
     init_checkpoint: a string, if not None then read in variables from this
       checkpoint path when initializing variables. Will only initialize
       variables that appear both in the current graph and the checkpoint.
+    init_variable_filter: a string, used only when init_checkpoint is set.
+      controls which variables are loaded from the checkpoint using regex.
+      if empty string (default), all variables from the checkpoint are loaded.
     ensemble_inputs: an optional integer - pass the size of the ensemble to
       train an ensemble where each model gets different inputs.
       You also need to configure Unitransformer.ensemble  to the right size.
@@ -411,6 +429,8 @@ def tpu_estimator_model_fn(model_type,
     ensemble_dims = ([mtf.Dimension("ensemble", ensemble_inputs)]
                      if ensemble_inputs else [])
 
+    predict_batch_size = features.pop("predict_batch_size", None)
+
     mtf_features = {}
     for key, x in features.items():
       # Some auxiliary features may have been generated in packing.
@@ -436,10 +456,10 @@ def tpu_estimator_model_fn(model_type,
             (mode, model_type, "" if should_exist else " not", feature_name))
         if "lm" in model_type:
           message += (
-              "\nA common mistake is that model_type=\"lm\" should be used "
-              "with tasks that produce inputs and targets, while "
-              "model_type=\"delimited_lm\" should be used with tasks that "
-              "produce targets only.")
+              "\nA common mistake is that model_type=\"delimited_lm\" should "
+              "be used with tasks that produce inputs and targets, while "
+              "model_type=\"lm\" should be used with tasks that produce "
+              "targets only.")
         raise ValueError(message)
 
     # Verify that the right features exist, and transform them if necessary
@@ -477,8 +497,8 @@ def tpu_estimator_model_fn(model_type,
       targets = mtf_features["targets"]
       if isinstance(transformer_model, transformer.Unitransformer):
         length_dim = targets.shape.dims[-1]
-        inputs = mtf.shift(mtf_features["targets"], offset=1,
-                           dim=length_dim, wrap=False)
+        inputs = transformer.autoregressive_inputs(
+            mtf_features["targets"])
       elif isinstance(transformer_model,
                       (transformer.Bitransformer,
                        transformer.StudentTeacher)):
@@ -545,6 +565,10 @@ def tpu_estimator_model_fn(model_type,
       inputs = _maybe_detokenize(inputs, inputs_vocabulary(vocabulary))
       outputs = _maybe_detokenize(outputs, targets_vocabulary(vocabulary))
 
+      if predict_batch_size is not None:
+        inputs = inputs[:predict_batch_size]
+        outputs = outputs[:predict_batch_size]
+
       predictions = {
           "inputs": inputs,
           "outputs": outputs,
@@ -594,9 +618,9 @@ def tpu_estimator_model_fn(model_type,
         loss: a mtf.Tensor
       """
       if model_type in ["lm", "delimited_lm"]:
-        _, _, length_dim = mtf_features["targets"].shape
-        inputs = mtf.shift(mtf_features["targets"], offset=1,
-                           dim=length_dim, wrap=False)
+        inputs = transformer.autoregressive_inputs(
+            mtf_features["targets"],
+            sequence_id=mtf_features.get("targets_segmentation", None))
       else:
         inputs = mtf_features["inputs"]
 
@@ -647,9 +671,6 @@ def tpu_estimator_model_fn(model_type,
 
       if tpu_summaries:
         mtf.scalar_summary("loss", loss)
-        for g in var_grads:
-          grad_norm = mtf.sqrt(mtf.reduce_sum(mtf.square(g)))
-          mtf.scalar_summary("grads/norm" + g.name[:-2], grad_norm)
 
       if callable(learning_rate_schedule):
         # the following happens on CPU since TPU can't handle summaries.
@@ -717,16 +738,26 @@ def tpu_estimator_model_fn(model_type,
 
         if init_checkpoint:
           ckpt_vars = {v for v, _ in tf.train.list_variables(init_checkpoint)}
+
+          if init_variable_filter:
+            pattern = re.compile(init_variable_filter)
+            ckpt_vars = {v for v in ckpt_vars if pattern.search(v)}
+
           global_vars = {v.op.name for v in tf.global_variables()}
-          restore_vars = ckpt_vars.intersection(global_vars)
+          restore_vars = {
+              v for v in global_vars if init_checkpoint_variable_mapping(v)
+              in ckpt_vars}
           tf.logging.info("Initializing variables from %s:", init_checkpoint)
           tf.logging.debug("\n".join(sorted(restore_vars)))
           tf.logging.info("Variables in %s but not in graph:", init_checkpoint)
-          tf.logging.info("\n".join(sorted(ckpt_vars - global_vars)))
+          tf.logging.info("\n".join(sorted(
+              ckpt_vars -
+              {init_checkpoint_variable_mapping(v) for v in global_vars})))
           tf.logging.info("Variables in graph but not in %s:", init_checkpoint)
-          tf.logging.info("\n".join(sorted(global_vars - ckpt_vars)))
+          tf.logging.info("\n".join(sorted(global_vars - restore_vars)))
           tf.train.init_from_checkpoint(
-              init_checkpoint, {v: v for v in restore_vars}
+              init_checkpoint,
+              {init_checkpoint_variable_mapping(v): v for v in restore_vars}
           )
 
         # Copy master variables to slices. Must be called first.
@@ -813,7 +844,8 @@ def tpu_estimator_model_fn(model_type,
                 "token_accuracy": tf.metrics.mean(token_correct, weights),
                 "sequence_accuracy": tf.metrics.mean(
                     sequence_correct, sequence_weights),
-                "mean_label": tf.metrics.mean(tf.cast(labels, tf.float32)),
+                "mean_label": tf.metrics.mean(
+                    tf.cast(labels, tf.float32), weights),
                 "num_eval_tokens": metric_sum(weights, name="num_eval_tokens"),
                 "max_targets_length": metric_max(tf.reduce_sum(
                     weights, axis=-1), name="max_targets_length"),
@@ -1229,43 +1261,6 @@ def clean_decodes(ids, eos_id=1, pad_id=0, length_axis=-1):
   return tf.where_v2(valid_ids, ids, pad_id)
 
 
-def _score_with_estimator(estimator, input_fn, eval_checkpoint_step, model_dir,
-                          score_postprocess_fn, vocabulary,
-                          num_examples=None):
-  """For each example returned by input_fn, compute log likelihood.
-
-  Args:
-    estimator: a TPUEstimator
-    input_fn: a function that that returns a tf.data.Dataset with examples
-      containing the string field 'targets' and optionally the field 'inputs'
-    eval_checkpoint_step: int, list of ints, or None, see `eval_model`
-      docstring.
-    model_dir: string, estimator model_dir
-    score_postprocess_fn: Function that takes in model outputs and
-      post-processes, saves, and returns then.
-    vocabulary: a vocabulary.Vocabulary or (inputs_vocabulary,
-      targets_vocabulary) tuple
-    num_examples: int, the total # of examples being scored, None if unknown
-
-  Returns:
-    a list of floats
-  """
-  checkpoint_path, = get_checkpoint_iterator(eval_checkpoint_step, model_dir)
-
-  result_iter = estimator.predict(input_fn, checkpoint_path=checkpoint_path)
-  # TODO(dei): This code is not well-designed for large-scale scoring, where the
-  # number of examples might exceed available memory.
-  results = list(result_iter)
-
-  if num_examples is None:
-    targets = [r["targets"] for r in results]
-    num_padded = next((i for i, x in enumerate(targets[::-1]) if x.any()), None)
-    num_examples = len(targets) - num_padded
-  results = results[:num_examples]
-
-  return score_postprocess_fn(results, vocabulary)
-
-
 @gin.configurable
 def save_scores(results, vocabulary,
                 scores_filename=None, save_example_text=True):
@@ -1295,14 +1290,14 @@ def save_scores(results, vocabulary,
 
   if save_example_text:
     # Targets will always exist.
-    targets = [r.get("targets_plaintext", r["targets"]) for r in results]
+    targets = [r.get("targets_pretokenized", r["targets"]) for r in results]
     targets = _maybe_decode_python(targets, targets_vocabulary(vocabulary))
     if scores_filename is not None:
       write_lines_to_file(targets, scores_filename+".targets")
 
     # Inputs may only exist for some tasks.
     if "inputs" in results[0]:
-      inputs = [r.get("inputs_plaintext", r["inputs"]) for r in results]
+      inputs = [r.get("inputs_pretokenized", r["inputs"]) for r in results]
       inputs = _maybe_decode_python(inputs, inputs_vocabulary(vocabulary))
       if scores_filename is not None:
         write_lines_to_file(inputs, scores_filename+".inputs")
@@ -1313,11 +1308,49 @@ def save_scores(results, vocabulary,
   return scores
 
 
+def score_with_estimator(estimator, input_fn, eval_checkpoint_step, model_dir,
+                         vocabulary, score_postprocess_fn=save_scores,
+                         num_examples=None):
+  """For each example returned by input_fn, compute log likelihood.
+
+  Args:
+    estimator: a TPUEstimator
+    input_fn: a function that that returns a tf.data.Dataset with examples
+      containing the string field 'targets' and optionally the field 'inputs'
+    eval_checkpoint_step: int, list of ints, or None, see `eval_model`
+      docstring.
+    model_dir: string, estimator model_dir
+    vocabulary: a vocabulary.Vocabulary or (inputs_vocabulary,
+      targets_vocabulary) tuple
+    score_postprocess_fn: a function that takes in model outputs and
+      post-processes, saves, and returns them.
+    num_examples: int, the total # of examples being scored, None if unknown
+
+  Returns:
+    a list of floats
+  """
+  checkpoint_path, = get_checkpoint_iterator(eval_checkpoint_step, model_dir)
+
+  result_iter = estimator.predict(input_fn, checkpoint_path=checkpoint_path)
+  # TODO(dei): This code is not well-designed for large-scale scoring, where the
+  # number of examples might exceed available memory.
+  results = list(result_iter)
+
+  if num_examples is None:
+    targets = [r["targets"] for r in results]
+    num_padded = next((i for i, x in enumerate(targets[::-1]) if x.any()), None)
+    num_examples = len(targets) - num_padded
+  results = results[:num_examples]
+
+  return score_postprocess_fn(results, vocabulary)
+
+
 def _maybe_decode_python(ids_or_strs, vocabulary):
   """Decode if ids_or_strs is not yet strings in pure python."""
 
   if ids_or_strs:
-    if not isinstance(ids_or_strs[0], str):
+    if isinstance(ids_or_strs[0], np.ndarray) and np.issubdtype(
+        ids_or_strs[0].dtype, np.integer):
       ids_or_strs = [vocabulary.decode(t.tolist()) for t in ids_or_strs]
   return ids_or_strs
 
@@ -1403,9 +1436,9 @@ def score_from_strings(estimator, vocabulary, model_type, batch_size,
     dataset = dataset.batch(batch_size, drop_remainder=True)
     return dataset.prefetch(tf.data.experimental.AUTOTUNE)
 
-  return _score_with_estimator(
+  return score_with_estimator(
       estimator, input_fn, eval_checkpoint_step, model_dir,
-      score_postprocess_fn, vocabulary, len(targets))
+      vocabulary, score_postprocess_fn, len(targets))
 
 
 @gin.configurable
@@ -1451,7 +1484,8 @@ def score_from_dataset(estimator, vocabulary, batch_size, sequence_length,
     dataset = None
     for scoring_dataset in scoring_datasets:
       ds = scoring_dataset.dataset_fn()
-      ds = ds.map(_filter_features)
+      ds = ds.map(
+          _filter_features, num_parallel_calls=tf.data.experimental.AUTOTUNE)
       dataset = dataset.concatenate(ds) if dataset else ds
 
     dataset = dataset.batch(batch_size, drop_remainder=False)
@@ -1461,9 +1495,9 @@ def score_from_dataset(estimator, vocabulary, batch_size, sequence_length,
     dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
     return dataset
 
-  return _score_with_estimator(
+  return score_with_estimator(
       estimator, input_fn, eval_checkpoint_step, model_dir,
-      score_postprocess_fn, vocabulary, None)
+      vocabulary, score_postprocess_fn, None)
 
 
 def get_estimator(model_type, vocabulary, mesh_shape,
@@ -1524,10 +1558,20 @@ def get_estimator(model_type, vocabulary, mesh_shape,
       per_host_input_for_training=tpu_config.InputPipelineConfig.BROADCAST,
   )
 
+  session_config = None
+  if use_tpu:
+    # meta-optimizer drastically slows down startup time and has little benefit
+    # when running on TPU.
+    session_config = tf.ConfigProto(
+        graph_options=tf.GraphOptions(
+            rewrite_options=rewriter_config_pb2.RewriterConfig(
+                disable_meta_optimizer=True)))
+
   run_config = tpu_config.RunConfig(
       cluster=cluster,
       model_dir=model_dir,
       tpu_config=my_tpu_config,
+      session_config=session_config,
       # We use a saver hook, so disable checkpoints here to prevent double
       # saving.
       save_checkpoints_steps=None,
@@ -1575,9 +1619,11 @@ def get_estimator(model_type, vocabulary, mesh_shape,
   return estimator
 
 
+@gin.configurable
 def train_model(estimator, vocabulary, sequence_length, batch_size,
                 train_dataset_fn, train_steps, ensemble_inputs,
-                dataset_split="train", skip_seen_data=False):
+                dataset_split="train", skip_seen_data=False,
+                seen_data_init_step=0):
   """Train a Mesh-TF model.
 
   Args:
@@ -1603,6 +1649,8 @@ def train_model(estimator, vocabulary, sequence_length, batch_size,
       restarts to skip already seen data. This flag is only consistent when
       every setting (such as batch size and random seed) on the model is the
       same between the original run and the new run.
+    seen_data_init_step: an integer, when `skip_seen_data` is True, skip seen
+      steps from this starting point. Useful when finetuning.
   """
 
   def input_fn(params):
@@ -1620,8 +1668,10 @@ def train_model(estimator, vocabulary, sequence_length, batch_size,
     # already been seen.
     if skip_seen_data and estimator.latest_checkpoint() is not None:
       recovered_step = estimator.get_variable_value("global_step")
-      tf.logging.info("Skipping %d steps of data.", recovered_step)
-      dataset = dataset.skip(recovered_step)
+      steps_to_skip = recovered_step - seen_data_init_step
+      if steps_to_skip > 0:
+        tf.logging.info("Skipping %d steps of data.", steps_to_skip)
+        dataset = dataset.skip(steps_to_skip)
     return dataset
 
   estimator.train(input_fn=input_fn, max_steps=train_steps)
@@ -1673,17 +1723,27 @@ def infer_model(estimator,
         output_filename=output_filename)
 
 
-def eval_model(estimator, vocabulary, sequence_length, batch_size,
-               dataset_split, model_dir, eval_dataset_fn, eval_summary_dir,
-               eval_checkpoint_step, eval_with_score=False):
+def eval_model(estimator,
+               vocabulary,
+               sequence_length,
+               batch_size,
+               dataset_split,
+               model_dir,
+               eval_dataset_fn,
+               eval_summary_dir,
+               eval_checkpoint_step,
+               eval_with_score=False,
+               output_eval_examples=True):
   """Eval a Mesh-TF model.
 
   Args:
-    estimator: Estimator object, created with the appropriate model_fn.
+    estimator: an Estimator object or a callable that returns one.
     vocabulary: a vocabulary.Vocabulary or (inputs_vocabulary,
       targets_vocabulary) tuple
     sequence_length: a dict from feature-key to integer the (packed)
-      sequence length, e.g. {"inputs": 512, "targets": 128}
+      sequence length, e.g. {"inputs": 512, "targets": 128}. May also be set to
+      `None` to automatically compute the maximum length of the examples, which
+      requires `estimator` to be a callable.
     batch_size: an integer, global batch size
     dataset_split: a string
     model_dir: a string, directory with the model.
@@ -1697,8 +1757,8 @@ def eval_model(estimator, vocabulary, sequence_length, batch_size,
         - name: string, the task name
         - dataset_fn: function which returns a tf.data.Dataset of tokenized and
           padded examples. Must not require any arguments and must include the
-          feature keys 'inputs' and 'targets_plaintext'.
-        - postprocess_fn: function which converts plaintext targets to values
+          feature keys 'inputs' and 'targets_pretokenized'.
+        - postprocess_fn: function which converts original targets to values
           that can be processed by a `metric_fn`.
         - list_of_metric_fns: list of metric functions with the call signature
           `metric_fn(targets, predictions)` which returns a dict mapping
@@ -1713,9 +1773,15 @@ def eval_model(estimator, vocabulary, sequence_length, batch_size,
       `tf.train.checkpoints_iterator`.
     eval_with_score: bool, whether to evaluate using log likelihood scores of
       targets instead of decoded predictions.
+    output_eval_examples: bool, whether to dump inputs, targets and predictions
+      of the eval examples in plaintext to eval_summary_dir.
   """
   if eval_dataset_fn is None:
     raise ValueError("Must provide eval_dataset_fn through gin for eval.")
+  if sequence_length is None and not callable(estimator):
+    raise ValueError(
+        "A callable must be passed for the estimator when automatically "
+        "computing the sequence length.")
 
   eval_datasets = eval_dataset_fn(
       sequence_length=sequence_length,
@@ -1745,34 +1811,70 @@ def eval_model(estimator, vocabulary, sequence_length, batch_size,
   # Pre-load in all of the targets once before entering continuous eval loop
   cached_targets = {}
   cached_examples = {}
-  # Need to create a separate graph for loading in plaintext targets
+  # Need to create a separate graph for loading in original targets
   # or else TF will complain that we modified the graph
+  max_sequence_length = {"inputs": 0, "targets": 0}
+
+  tf.logging.info("Caching evaluation examples.")
   with tf.Graph().as_default():
     for eval_dataset in eval_datasets:
       if eval_dataset.metric_fns:
         ds = eval_dataset.dataset_fn()
         # Create list of postprocessed text targets
-        examples = [ex for ex in tfds.as_numpy(ds)]
-        targets = [
-            eval_dataset.postprocess_fn(  # pylint:disable=g-complex-comprehension
-                tf.compat.as_text(ex["targets_plaintext"]),
-                example=ex, is_target=True)
-            for ex in examples
-        ]
-        targets_filename = os.path.join(
-            eval_summary_dir,
-            "{}_targets".format(eval_dataset.name),
-        )
-        write_lines_to_file(targets, targets_filename)
-
-        inputs_filename = os.path.join(
-            eval_summary_dir,
-            "{}_inputs".format(eval_dataset.name))
-        inputs = [ex["inputs_plaintext"] for ex in examples]
-        write_lines_to_file(inputs, inputs_filename)
+        inputs = []
+        targets = []
+        examples = []
+        for ex in tfds.as_numpy(ds):
+          max_sequence_length["inputs"] = max(
+              max_sequence_length["inputs"], len(ex["inputs"]))
+          max_sequence_length["targets"] = max(
+              max_sequence_length["targets"], len(ex["targets"]))
+          examples.append(ex)
+          if "inputs_pretokenized" in ex:
+            inputs.append(ex["inputs_pretokenized"])
+          if "targets_pretokenized" in ex:
+            targets_pretokenized = ex["targets_pretokenized"]
+            if isinstance(targets_pretokenized, bytes):
+              targets_pretokenized = targets_pretokenized.decode("utf-8")
+            targets.append(
+                eval_dataset.postprocess_fn(
+                    targets_pretokenized, example=ex, is_target=True)
+            )
+        if output_eval_examples:
+          targets_filename = os.path.join(
+              eval_summary_dir,
+              "{}_targets".format(eval_dataset.name),
+          )
+          write_lines_to_file(targets, targets_filename)
+          inputs_filename = os.path.join(eval_summary_dir,
+                                         "{}_inputs".format(eval_dataset.name))
+          write_lines_to_file(inputs, inputs_filename)
 
         cached_targets[eval_dataset.name] = targets
         cached_examples[eval_dataset.name] = examples
+  if sequence_length is None:
+    tf.logging.info("Setting sequence lengths to %s", max_sequence_length)
+    sequence_length = max_sequence_length
+    estimator = functools.partial(estimator, sequence_length=sequence_length)
+  elif (sequence_length["inputs"] < max_sequence_length["inputs"] or
+        sequence_length["targets"] < max_sequence_length["targets"]):
+    tf.logging.warning(
+        "Given sequence lengths are insufficient for some evaluation inputs or "
+        "targets. These sequences will be truncated to fit, likely leading to "
+        "sub-optimal results. Consider passing `None` for sequence_length to "
+        "have them be automatically computed.\n Got: %s,\n Max Lengths: %s",
+        sequence_length, max_sequence_length)
+  elif (sequence_length["inputs"] > max_sequence_length["inputs"] or
+        sequence_length["targets"] > max_sequence_length["targets"]):
+    tf.logging.warning(
+        "Given sequence lengths are longer than necessary for some evaluation "
+        "inputs or targets, resulting in wasted computation. Consider passing "
+        "`None` for sequence_length to have them be automatically computed.\n"
+        " Got: %s,\n Max Lengths: %s",
+        sequence_length, max_sequence_length)
+
+  if callable(estimator):
+    estimator = estimator()
 
   def input_fn(params):
     """Eval input function for estimator."""
@@ -1780,10 +1882,11 @@ def eval_model(estimator, vocabulary, sequence_length, batch_size,
     # Concatenate all dataset inputs to only have to do one decode loop
     combined_ds = None
     for eval_dataset in eval_datasets:
-      # Only cache targets for those tasks with eval functions provides
+      # Only evaluate tasks with metrics.
       if eval_dataset.metric_fns:
-        ds = eval_dataset.dataset_fn()
-        ds = ds.map(_filter_features)
+        ds = eval_dataset.dataset_fn(sequence_length=sequence_length)
+        ds = ds.map(
+            _filter_features, num_parallel_calls=tf.data.experimental.AUTOTUNE)
         combined_ds = ds if not combined_ds else combined_ds.concatenate(ds)
     combined_ds = combined_ds.batch(batch_size, drop_remainder=False)
     # Pad the final batch.
@@ -1797,13 +1900,13 @@ def eval_model(estimator, vocabulary, sequence_length, batch_size,
     tf.logging.info("Checkpoint path %s" % checkpoint_path)
     global_step = int(get_step_from_checkpoint_path(checkpoint_path))
     if eval_with_score:
-      outputs, _ = _score_with_estimator(
-          estimator, input_fn, global_step, model_dir, save_scores, vocabulary,
+      outputs, _ = score_with_estimator(
+          estimator, input_fn, global_step, model_dir, vocabulary,
           num_examples=sum(len(cex) for cex in cached_examples.values()))
     else:
       outputs = [
-          tf.compat.as_text(d) for d in
-          decode(estimator, input_fn, vocabulary, checkpoint_path)
+          d.decode("utf-8") if isinstance(d, bytes) else d
+          for d in decode(estimator, input_fn, vocabulary, checkpoint_path)
       ]
     for eval_dataset in eval_datasets:
       # Extract the portion of decodes corresponding to this dataset
@@ -1818,11 +1921,12 @@ def eval_model(estimator, vocabulary, sequence_length, batch_size,
 
       global_step = int(get_step_from_checkpoint_path(checkpoint_path))
 
-      predictions_filename = os.path.join(
-          eval_summary_dir,
-          "{}_{}_predictions".format(eval_dataset.name, global_step),
-      )
-      write_lines_to_file(predictions, predictions_filename)
+      if output_eval_examples:
+        predictions_filename = os.path.join(
+            eval_summary_dir,
+            "{}_{}_predictions".format(eval_dataset.name, global_step),
+        )
+        write_lines_to_file(predictions, predictions_filename)
 
       for metric_fn in eval_dataset.metric_fns:
         summary = tf.Summary()
@@ -1843,7 +1947,7 @@ def eval_model(estimator, vocabulary, sequence_length, batch_size,
 
 
 def export_model(estimator, export_dir, vocabulary, sequence_length,
-                 model_type, score_mode=False, batch_size=1,
+                 model_type, eval_with_score=False, batch_size=1,
                  checkpoint_path=None):
   """Export a model in TF SavedModel format to be used for inference on CPUs.
 
@@ -1856,7 +1960,7 @@ def export_model(estimator, export_dir, vocabulary, sequence_length,
     sequence_length: an integer or a dict from feature-key to integer
       the (packed) sequence length, e.g. {"inputs": 512, "targets": 128}
     model_type: a string, see `get_estimator` docstring for details.
-    score_mode: If True, compute log-likelihood scores of targets.
+    eval_with_score: If True, compute log-likelihood scores of targets.
       If False, do inference to generate outputs.
     batch_size: int, number of sequences per batch. Should match estimator.
     checkpoint_path: str, path to checkpoint. If None (default), use the most
@@ -1878,15 +1982,16 @@ def export_model(estimator, export_dir, vocabulary, sequence_length,
     def str_placeholder(name):
       return tf.placeholder(dtype=tf.string, shape=[None], name=name)
 
-    if model_type == "lm" or not score_mode:
+    if model_type == "lm" or not eval_with_score:
       # In this case, users of exported model provide only one feature, which is
       # "targets" if scoring or "inputs" if doing prediction.
 
-      input_key = "targets" if score_mode else "inputs"
-      vocab_to_use = (targets_vocabulary(vocabulary) if score_mode
+      input_key = "targets" if eval_with_score else "inputs"
+      vocab_to_use = (targets_vocabulary(vocabulary) if eval_with_score
                       else inputs_vocabulary(vocabulary))
       targets = str_placeholder(input_key)
 
+      predict_batch_size = tf.shape(targets)[0]
       dataset = tf.data.Dataset.from_tensor_slices({input_key: targets})
       dataset = transformer_dataset.encode_all_features(dataset, vocab_to_use)
 
@@ -1898,6 +2003,7 @@ def export_model(estimator, export_dir, vocabulary, sequence_length,
       inputs = str_placeholder("inputs")
       targets = str_placeholder("targets")
 
+      predict_batch_size = tf.shape(inputs)[0]
       dataset = tf.data.Dataset.from_tensor_slices(
           {"inputs": inputs, "targets": targets})
       dataset = transformer_dataset.encode_all_features(dataset, vocabulary)
@@ -1912,11 +2018,13 @@ def export_model(estimator, export_dir, vocabulary, sequence_length,
     )
 
     # Batch, and pad final batch.
-    dataset = dataset.batch(batch_size, drop_remainder=True)
+    tf.debugging.assert_less_equal(predict_batch_size, batch_size)
+    dataset = dataset.batch(batch_size, drop_remainder=False)
     dataset = transformer_dataset.trim_and_pad_dataset(
         dataset, length=batch_size)
 
     features = tf.data.experimental.get_single_element(dataset)
+    features["predict_batch_size"] = predict_batch_size
     return tf.estimator.export.ServingInputReceiver(
         features=features, receiver_tensors=receiver_tensors)
 
@@ -1961,7 +2069,6 @@ def compute_batch_size(sequence_length,
   Returns:
     an integer - the number of sequences per batch
   """
-  sequence_length = max(sequence_length.values())
   def checkdiv(a, b):
     if a % b:
       raise ValueError("%d is not divisible by %d" % (a, b))
@@ -1974,7 +2081,8 @@ def compute_batch_size(sequence_length,
   method, value = method_and_value
   if method == "sequences_per_batch":
     return value
-  elif method == "tokens_per_batch":
+  sequence_length = max(sequence_length.values())
+  if method == "tokens_per_batch":
     return checkdiv(value, sequence_length)
   elif method == "sequences_per_replica":
     return value * num_replicas
@@ -2032,7 +2140,7 @@ def serialize_num_microbatches(batch_dim,
       sequence_length,
       batch_per_replica,
       num_microbatches)
-  return num_microbatches
+  return int(num_microbatches)
 
 
 @gin.configurable
@@ -2069,8 +2177,9 @@ def get_checkpoint_iterator(checkpoint_step, model_dir, skip_until=0,
       list of ints, replace each int with the path to the checkpoint with the
       closest global step. If checkpoint_step == "all", return the path of every
       checkpoint in model_dir, starting from the earliest checkpoint. If
-      checkpoint_step is None, return `tf.train.checkpoints_iterator`
-      for `model_dir`.
+      checkpoint_step == -1, return the latest checkpoint as specified in
+      model_dir/checkpoint. If checkpoint_step is None, return
+      `tf.train.checkpoints_iterator` for `model_dir`.
     model_dir: str, directory to look for checkpoints in.
     skip_until: an integer - for "all" or "None" behavior, filter out
       checkpoint numbers that are <= skip_until.
@@ -2116,6 +2225,8 @@ def get_checkpoint_iterator(checkpoint_step, model_dir, skip_until=0,
     ckpt_steps = {get_step_from_checkpoint_path(p) for p in ckpt_paths}
     return filter(_filter_fn,
                   [_get_checkpoint_path(s) for s in sorted(list(ckpt_steps))])
+  elif checkpoint_step == -1:
+    return [tf.train.latest_checkpoint(model_dir)]
   elif checkpoint_step is None:
     checkpoints_iterator = filter(
         _filter_fn, tf.train.checkpoints_iterator(model_dir))
@@ -2141,7 +2252,9 @@ def get_checkpoint_iterator(checkpoint_step, model_dir, skip_until=0,
 # example: "d_ff:model,heads:model,vocab:model"
 @gin.configurable
 def run(tpu_job_name,
-        tpu, gcp_project, tpu_zone,
+        tpu,
+        gcp_project,
+        tpu_zone,
         model_dir,
         model_type="bitransformer",
         vocabulary=None,
@@ -2159,7 +2272,8 @@ def run(tpu_job_name,
         eval_summary_dir=None,
         batch_size=("tokens_per_replica", 2048),
         train_steps=auto_train_steps,
-        sequence_length=gin.REQUIRED,
+        total_run_steps=None,
+        sequence_length=None,
         mesh_shape=gin.REQUIRED,
         mesh_devices=None,
         layout_rules=gin.REQUIRED,
@@ -2171,7 +2285,8 @@ def run(tpu_job_name,
         init_checkpoint=None,
         ensemble_inputs=None,
         train_model_fn=train_model,
-        skip_seen_data=False):
+        skip_seen_data=False,
+        output_eval_examples=True):
   """Run training, eval, or inference depending on `mode`.
 
   Args:
@@ -2212,9 +2327,14 @@ def run(tpu_job_name,
       compute_batch_size(). Note that this is the global batch size and not the
       per-shard batch size.
     train_steps: An integer or a function with the same signature as
-      auto_train_steps().  Total number of training steps.
+      auto_train_steps().  Total number of training steps in this run.
+    total_run_steps: An integer, used when training is split over multiple
+      runs. This value is gin-configurable and used to set the total_run_steps
+      for the learning_rate_schedule.
     sequence_length: an integer or a dict from feature-key to integer
-      the (packed) sequence length, e.g. {"inputs": 512, "targets": 128}
+      the (packed) sequence length, e.g. {"inputs": 512, "targets": 128}.
+      May also be set to `None` in eval mode to automatically compute the
+      maximum length of the examples.
     mesh_shape: an input to mtf.convert_to_shape()
     mesh_devices: a list of strings, see `get_estimator` docstring.
     layout_rules: an input to mtf.convert_to_layout_rules()
@@ -2233,6 +2353,9 @@ def run(tpu_job_name,
       restarts to skip already seen data. This flag is only consistent when
       every setting (such as batch size and random seed) on the model is the
       same between the original run and the new run.
+    output_eval_examples: a boolean, is `True` by default. Used to decide
+      whether to output whether to dump inputs, targets, and predictions of the
+      eval examples in plaintext to eval_summary_dir.
   """
   if isinstance(sequence_length, int):
     sequence_length = {"inputs": sequence_length,
@@ -2245,20 +2368,24 @@ def run(tpu_job_name,
   if not isinstance(train_steps, int):
     train_steps = train_steps(batch_size, sequence_length)
 
+  if total_run_steps is None:
+    total_run_steps = train_steps
   if isinstance(learning_rate_schedule, list):
     learning_rate_schedule = functools.partial(
         learning_rate_schedules.product_learning_rate,
-        factors=learning_rate_schedule)
+        total_train_steps=total_run_steps, factors=learning_rate_schedule)
 
   if callable(learning_rate_schedule):
     learning_rate_schedule = functools.partial(
-        learning_rate_schedule, total_train_steps=train_steps)
+        learning_rate_schedule, total_train_steps=total_run_steps)
 
   tf.logging.info("model_type=%s" % model_type,)
   tf.logging.info("mode=%s" % mode,)
   tf.logging.info("sequence_length=%s" % sequence_length,)
   tf.logging.info("batch_size=%s" % batch_size,)
   tf.logging.info("train_steps=%s" % train_steps,)
+  if total_run_steps is not None:
+    tf.logging.info("total_run_steps=%s" % total_run_steps,)
   tf.logging.info("mesh_shape=%s" % mesh_shape,)
   tf.logging.info("layout_rules=%s" % layout_rules,)
 
@@ -2279,7 +2406,8 @@ def run(tpu_job_name,
   )
 
   score_in_predict_mode = "score" in mode
-  estimator = get_estimator(
+  estimator_fn = functools.partial(
+      get_estimator,
       model_type=model_type,
       vocabulary=vocabulary,
       layout_rules=layout_rules,
@@ -2302,6 +2430,11 @@ def run(tpu_job_name,
       iterations_per_loop=iterations_per_loop,
       cluster=cluster,
       mesh_devices=mesh_devices)
+
+  if mode not in ("eval", "score_eval"):
+    if sequence_length is None:
+      raise ValueError(f"`sequence_length` must be specified in '{mode}' mode.")
+    estimator = estimator_fn()
 
   if mode == "train":
     # train_dataset_fn could be None if train_model_fn is not equal to
@@ -2337,7 +2470,8 @@ def run(tpu_job_name,
       )
     def _input_fn(params, eval_dataset):
       del params
-      ds = eval_dataset.dataset_fn().map(_filter_features)
+      ds = eval_dataset.dataset_fn().map(
+          _filter_features, num_parallel_calls=tf.data.experimental.AUTOTUNE)
       ds = transformer_dataset.pad_dataset_with_zeroed_out_examples(ds)
       ds = (ds.batch(batch_size * (ensemble_inputs or 1), drop_remainder=True)
             .prefetch(tf.data.experimental.AUTOTUNE))
@@ -2357,9 +2491,18 @@ def run(tpu_job_name,
             checkpoint_path=checkpoint_path,
             name=name)
   elif mode in ("eval", "score_eval"):
-    eval_model(estimator, vocabulary, sequence_length, batch_size,
-               dataset_split, model_dir, eval_dataset_fn, eval_summary_dir,
-               eval_checkpoint_step, eval_with_score=(mode == "score_eval"))
+    eval_model(
+        estimator_fn,
+        vocabulary,
+        sequence_length,
+        batch_size,
+        dataset_split,
+        model_dir,
+        eval_dataset_fn,
+        eval_summary_dir,
+        eval_checkpoint_step,
+        eval_with_score=(mode == "score_eval"),
+        output_eval_examples=output_eval_examples)
   elif mode == "infer":
     infer_model(estimator, vocabulary, sequence_length, batch_size, model_type,
                 model_dir, eval_checkpoint_step)

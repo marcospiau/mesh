@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2020 The Mesh TensorFlow Authors.
+# Copyright 2021 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -818,7 +818,7 @@ class Unitransformer(object):
           ensemble_dim=self.ensemble_dim)
     if context.train:
       inputs = mtf.dropout(inputs, rate=self.token_dropout_rate)
-    x = vocab_embedding.ids_to_embedding(inputs)
+    x = vocab_embedding.ids_to_embedding(inputs, context)
     if self.positional_embedding or self.sinusoid_positional_embedding:
       if self.sinusoid_positional_embedding:
         pos_emb_var = sinusoid_positional_embedding_weights(
@@ -877,7 +877,7 @@ class Unitransformer(object):
     """Denominator applied to losses.
 
     This is usually the size of the targets tensor (omitting ensemble
-    dimensions).  Alternitively, it is an override value passed to the
+    dimensions).  Alternatively, it is an override value passed to the
     class constructor.
 
     Args:
@@ -919,8 +919,8 @@ class Unitransformer(object):
 
     Args:
       inputs: an int32 Tensor with shape [<batch_dims>, length_dim] For training
-        autoregressive models this should be equal to mtf.shift(targets,
-        offset=1, dim=length_dim, wrap=False)
+        autoregressive models this should be equal to
+        autoregressive_inputs(targets, sequence_id).
       targets: an optional int32 Tensor with shape [<batch_dims>, length_dim]
       compute_loss: a boolean
       mode: a tf.estimator.ModeKeys
@@ -942,9 +942,6 @@ class Unitransformer(object):
       logits: a Tensor with shape [<batch_dims>, output_vocab_dim]
       loss: an optional Scalar (if compute_loss=True)
     """
-    # Negative ids are used to indicate masked loss during training.
-    # Switch them back to positive numbers.
-    inputs = mtf.abs(inputs)
     batch_dims = inputs.shape.dims[:-1]
     length_dim = inputs.shape.dims[-1]
     length_range = mtf.range(inputs.mesh, length_dim, dtype=tf.int32)
@@ -1099,7 +1096,7 @@ class Unitransformer(object):
         inputs=inputs,
         encoder_inputs=encoder_inputs)
 
-    shifted_inputs = mtf.shift(inputs, offset=1, dim=length_dim, wrap=False)
+    shifted_inputs = autoregressive_inputs(inputs)
     with tf.variable_scope(self.name):
       logits = self._call_internal(context_first_part, shifted_inputs)
       logits_output = logits
@@ -1275,7 +1272,7 @@ class Unitransformer(object):
         inputs=inputs,
         encoder_inputs=encoder_inputs)
 
-    shifted_inputs = mtf.shift(inputs, offset=1, dim=length_dim, wrap=False)
+    shifted_inputs = autoregressive_inputs(inputs)
     with tf.variable_scope(self.name):
       logits = self._call_internal(context_first_part, shifted_inputs)
     del logits
@@ -1333,6 +1330,8 @@ class Unitransformer(object):
 def shift_targets(targets, bos_id=0, eos_id=1):
   """Transforms decoder labels to decoder inputs.
 
+  DEPRECATED - use autoregressive_inputs()
+
   Args:
     targets: decoder labels
     bos_id: begin of sequence id, defaults to 0
@@ -1341,6 +1340,8 @@ def shift_targets(targets, bos_id=0, eos_id=1):
   Returns:
     Decoder inputs.
   """
+  tf.logging.warning("warning: shift_targets is deprecated - "
+                     "use autoregressive_inputs() instead.")
   length_dim = targets.shape.dims[-1]
   shifted_targets = mtf.shift(targets, offset=1, dim=length_dim, wrap=False)
   # We should have a 0 at the beginning of each sequence rather than the
@@ -1354,6 +1355,37 @@ def shift_targets(targets, bos_id=0, eos_id=1):
             mtf.not_equal(targets, 0))) * bos_id
 
   return shifted_targets
+
+
+def autoregressive_inputs(targets, sequence_id=None):
+  """Generate inputs for an autoregressive model, by shifting the targets.
+
+  For the first element of each sequence, the returned input id is 0.
+
+  For a "packed" dataset, also pass the sequence_id tensor, which aligns
+  with the targets tensor and contains different values for different
+  concatenated examples.
+
+  Args:
+    targets: a tf.int32 Tensor with shape [..., length_dim]
+    sequence_id: an optional Tensor with the same shape as targets
+
+  Returns:
+    a Tensor with dtype tf.int32 and the same shape as targets.
+  """
+  length_dim = targets.shape.dims[-1]
+  inputs = mtf.shift(targets, offset=1, dim=length_dim, wrap=False)
+  # Negative ids are used to indicate masked loss during training.
+  # Switch them back to positive numbers.
+  inputs = mtf.abs(inputs)
+  # We should have a 0 at the beginning of each sequence rather than the
+  # shifted EOS (e.g. 1) from the previous sequence.
+  if sequence_id is not None:
+    not_first_in_sequence = mtf.equal(
+        sequence_id,
+        mtf.shift(sequence_id, offset=1, dim=length_dim, wrap=False))
+    inputs *= mtf.to_int32(not_first_in_sequence)
+  return inputs
 
 
 @gin.configurable
@@ -1487,7 +1519,7 @@ class Bitransformer(object):
           encoder_sequence_id)
 
     logits, loss = self.decoder.call_simple(
-        shift_targets(targets),
+        autoregressive_inputs(targets, sequence_id=decoder_sequence_id),
         targets,
         compute_loss,
         mode=mode,
@@ -1851,7 +1883,8 @@ def make_bitransformer(
     layout=None,
     mesh_shape=None,
     encoder_name="encoder",
-    decoder_name="decoder"):
+    decoder_name="decoder",
+    bitransformer_cls=Bitransformer):
   """Gin-configurable bitransformer constructor.
 
   In your config file you need to set the encoder and decoder layers like this:
@@ -1874,8 +1907,10 @@ def make_bitransformer(
       Some layers (e.g. MoE layers) cheat by looking at layout and mesh_shape
     encoder_name: optional - a string giving the Unitransformer encoder name.
     decoder_name: optional - a string giving the Unitransformer decoder name.
+    bitransformer_cls: a class that implements the bitransformer with the
+      encoder and decoder both of which are Unitransformer instances.
   Returns:
-    a Bitransformer
+    a bitransformer_cls instance
   """
   with gin.config_scope("encoder"):
     encoder = Unitransformer(
@@ -1895,7 +1930,7 @@ def make_bitransformer(
         name=decoder_name,
         layout=layout,
         mesh_shape=mesh_shape)
-  return Bitransformer(encoder, decoder)
+  return bitransformer_cls(encoder, decoder)
 
 
 @gin.configurable
@@ -2052,7 +2087,8 @@ class VocabEmbedding(object):
         ensemble_dim=ensemble_dim,
         initializer=initializer)
 
-  def ids_to_embedding(self, ids):
+  def ids_to_embedding(self, ids, context):
+    del context
     ret = mtf.gather(self._embedding_weights, ids, self._vocab_dim)
     if self._scale_variable_like_classifier_weights:
       ret *= self._output_dim.size ** 0.5
