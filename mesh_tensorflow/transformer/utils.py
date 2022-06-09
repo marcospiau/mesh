@@ -1359,8 +1359,6 @@ def decode(estimator,
         result["inputs"], inputs_vocabulary(vocabulary))
     output_string = _maybe_detokenize(
         result["outputs"], targets_vocabulary(vocabulary))
-<<<<<<< HEAD
-
     scores = result["scores"][0]
     scores = scores[[6136, 1176]].tolist()
     scores = [float(score) for score in scores]
@@ -1368,9 +1366,7 @@ def decode(estimator,
     score_string = probs.tolist()[1]
     output_string = f"{output_string}\t{score_string}"
     decodes.append(output_string)
-=======
     yield output_string
->>>>>>> 6d440456e4d0d474b07546c8cf06eb83409b2bf1
     if i & (i - 1) == 0:
       # LOG every power of 2.
       tf.logging.info("decoded %s: %s", i, input_string)
