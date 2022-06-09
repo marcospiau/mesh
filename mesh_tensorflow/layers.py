@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The Mesh TensorFlow Authors.
+# Copyright 2022 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,6 +25,22 @@ import gin
 from mesh_tensorflow import ops_with_redefined_builtins as mtf
 
 import tensorflow.compat.v1 as tf
+
+
+def summary_for_clip_activation_gradient(t, name=None, batch_dims=None):
+  """Summary for clip activation gradient."""
+
+  mtf.scalar_summary("mean/", mtf.reduce_mean(t))
+  mtf.scalar_summary("max/", mtf.reduce_max(t))
+
+  if batch_dims:
+    rms_batch = mtf.sqrt(
+        mtf.reduce_mean(mtf.square(t), output_shape=batch_dims))
+    mtf.scalar_summary("rms_mean/%s" % name, mtf.reduce_mean(rms_batch))
+    mtf.scalar_summary("rms_max/%s" % name, mtf.reduce_max(rms_batch))
+    mtf.scalar_summary(
+        "rms_var/%s" % name,
+        mtf.reduce_mean(mtf.square(rms_batch - mtf.reduce_mean(rms_batch))))
 
 
 @gin.configurable
@@ -931,6 +947,39 @@ def conv3d_transpose_with_blocks(
       variable_dtype, name)
 
 
+def corr(x, dim, epsilon=1e-20, name="pearson_correlation"):
+  """Compute correlation along dimension dim, equiv to tfp.stats.correlation.
+
+  It treats the dim Dimension as the random event axis, and all the other dims
+  as the sample axis. Pearson correlation is computed between random events in
+  dim Dimension, and marginalized over the other dims.
+
+  Example usage:
+    inputs = tf.random_normal([batch, channels])
+    mtf_inputs = mtf.import_tf_tensor(
+        mesh, inputs, shape=mtf.Shape([batch_dim, channels_dim]))
+    correlation = corr(mtf_inputs, dim=channels_dim)
+
+  Args:
+    x: a mtf.Tensor whose shape contains dim.
+    dim: a mtf.Dimension.
+    epsilon: a small floating point number for numerical stability.
+    name: a string used for tf.variable_scope.
+
+  Returns:
+    a mtf.Tensor with the shape of [dim, dim].
+  """
+  with tf.variable_scope(name):
+    mean = mtf.reduce_mean(x, output_shape=[dim])
+    dim_name = dim.name
+    x1 = mtf.rename_dimension(x - mean, dim_name, f"{dim_name}_1")
+    x2 = mtf.rename_dimension(x - mean, dim_name, f"{dim_name}_2")
+    variance = lambda z: mtf.sqrt(  # pylint: disable=g-long-lambda
+        mtf.reduce_sum(mtf.square(z), output_shape=z.shape.dims[-1:])) + epsilon
+    v1, v2 = variance(x1), variance(x2)
+    return mtf.matmul(x1, x2) / mtf.matmul(v1, v2)
+
+
 def layer_norm(x, dim, epsilon=1e-6, name="layer_prepostprocess"):
   """Layer normalization over dimension dim.
 
@@ -1131,6 +1180,7 @@ def weights_nonzero(targets, dtype=tf.float32):
 
 def dense_relu_dense(x,
                      hidden_channels,
+                     is_training,
                      dropout=0.0,
                      dropout_broadcast_dims=None,
                      master_dtype=tf.float32,
@@ -1142,6 +1192,7 @@ def dense_relu_dense(x,
   Args:
     x: a mtf.Tensor
     hidden_channels: a mtf.Dimension - channels in the hidden layer
+    is_training: a boolean, set to true while training
     dropout: an optional float
     dropout_broadcast_dims: an optional list of mtf.Dimension
     master_dtype: a tf.dtype
@@ -1156,9 +1207,8 @@ def dense_relu_dense(x,
     h = dense(x, hidden_channels,
               use_bias=False, activation=mtf.relu,
               master_dtype=master_dtype, slice_dtype=slice_dtype, name="wi")
-    if dropout != 0.0:
-      h = mtf.dropout(h, 1.0 - dropout,
-                      noise_shape=h.shape - dropout_broadcast_dims)
+    h = mtf.dropout(h, is_training, 1.0 - dropout,
+                    noise_shape=h.shape - dropout_broadcast_dims)
     return dense(h, io_channels, use_bias=False, activation=None,
                  master_dtype=master_dtype, slice_dtype=slice_dtype,
                  name="wo")
@@ -1187,6 +1237,7 @@ def local_self_attention_spatial_blocks(
     query_antecedent,
     kv_channels,
     heads,
+    is_training,
     memory_w_dim=None,
     mask_right=False,
     master_dtype=tf.float32,
@@ -1205,6 +1256,7 @@ def local_self_attention_spatial_blocks(
       must have the same size as query_length, but a different name.
     kv_channels: a mtf.Dimension (the size of the key and value vectors)
     heads: a mtf.Dimension (the number of heads)
+    is_training: a bool, is true if training, else false.
     memory_w_dim: mtf Dimension, for the memory width block.
     mask_right: bool, flag specifying whether we mask out attention to the right
       for the decoder.
@@ -1255,7 +1307,7 @@ def local_self_attention_spatial_blocks(
       mask = attention_bias_local_block(
           query_antecedent.mesh, w_dim, memory_w_dim)
 
-    output = dot_product_attention(q, k, v, mask=mask)
+    output = dot_product_attention(q, k, v, mask=mask, is_training=is_training)
 
     return mtf.einsum(
         [output, wo], mtf.Shape([batch, num_w_blocks, w_dim, io_channels]))
@@ -1264,6 +1316,7 @@ def local_self_attention_spatial_blocks(
 def masked_local_attention_1d(x,
                               kv_channels,
                               heads,
+                              is_training,
                               window_size=128,
                               master_dtype=tf.float32,
                               slice_dtype=tf.float32,
@@ -1280,6 +1333,7 @@ def masked_local_attention_1d(x,
     x: a mtf.Tensor with shape batch_dims + [length, io_channels]
     kv_channels: a mtf.Dimension (the size of the key and value vectors)
     heads: a mtf.Dimension (the number of heads)
+    is_training: a bool, is True if training else False.
     window_size: an integer
     master_dtype: a tf.dtype (deprecated - use params arg)
     slice_dtype: a tf.dtype (deprecated - use params arg)
@@ -1351,7 +1405,7 @@ def masked_local_attention_1d(x,
     # Note: The first window_size-1 positions can see back into pre-time
     # where all the keys and values are zero.  We could mask this out, but we
     # don't.
-    o = dot_product_attention(q, k, v, mask=mask)
+    o = dot_product_attention(q, k, v, mask=mask, is_training=is_training)
     o = mtf.reshape(o, batch_dims + [heads, length, kv_channels])
     return mtf.einsum([o, wo], mtf.Shape(batch_dims + [length, io_channels]))
 
@@ -1408,7 +1462,7 @@ def masked_local_attention_1d_incremental(x,
         mtf.mod(step_num, window_length.size))
     k = mtf.where(current_position, k, prev_k, output_shape=prev_k.shape)
     v = mtf.where(current_position, v, prev_v, output_shape=prev_v.shape)
-    o = dot_product_attention(q, k, v, mask=None)
+    o = dot_product_attention(q, k, v, mask=None, is_training=False)
     y = mtf.einsum([o, wo], x.shape)
     return y, k, v
 
@@ -1441,6 +1495,7 @@ def local_2d_halo_exchange(k, v, num_h_blocks, h_dim,
 def local_2d_self_attention_spatial_blocks(query_antecedent,
                                            kv_channels,
                                            heads,
+                                           is_training,
                                            memory_h_dim=None,
                                            memory_w_dim=None,
                                            mask_right=False,
@@ -1460,6 +1515,7 @@ def local_2d_self_attention_spatial_blocks(query_antecedent,
       query_length, but a different name.
     kv_channels: a mtf.Dimension (the size of the key and value vectors)
     heads: a mtf.Dimension (the number of heads)
+    is_training: a bool, is True while training else False.
     memory_h_dim: mtf Dimension, for the memory height block.
     memory_w_dim: mtf Dimension, for the memory width block.
     mask_right: bool, flag specifying whether we mask out attention to the right
@@ -1515,7 +1571,7 @@ def local_2d_self_attention_spatial_blocks(query_antecedent,
       mask = attention_bias_local_2d_block(query_antecedent.mesh, h_dim, w_dim,
                                            memory_h_dim, memory_w_dim)
 
-    output = dot_product_attention(q, k, v, mask=mask)
+    output = dot_product_attention(q, k, v, mask=mask, is_training=is_training)
 
     return mtf.einsum(
         [output, wo],
@@ -1592,6 +1648,7 @@ def dot_product_attention(q,
                           k,
                           v,
                           mask,
+                          is_training,
                           dropout=0.0,
                           dropout_broadcast_dims=None,
                           extra_logit=None):
@@ -1605,6 +1662,7 @@ def dot_product_attention(q,
     v: Tensor with shape [..., length_kv, depth_v] Leading dimensions must
       match with q.
     mask: mask Tensor (see attention_mask())
+    is_training: a boolean, set to true while training
     dropout: a float.
     dropout_broadcast_dims: an optional list of mtf.Dimension
     extra_logit: an optional scalar or tensor
@@ -1618,10 +1676,9 @@ def dot_product_attention(q,
   if mask is not None:
     logits += mask
   weights = mtf.softmax(logits, length_kv, extra_logit=extra_logit)
-  if dropout != 0.0:
-    weights = mtf.dropout(
-        weights, 1.0 - dropout,
-        noise_shape=weights.shape - dropout_broadcast_dims)
+  weights = mtf.dropout(
+      weights, is_training, 1.0 - dropout,
+      noise_shape=weights.shape - dropout_broadcast_dims)
   depth_v = v.shape.dims[-1]
   outputs_shape = mtf.Shape(q.shape.dims[:-1] + [depth_v])
   outputs = mtf.einsum([weights, v], outputs_shape)
@@ -1633,6 +1690,7 @@ def multihead_attention(query_antecedent,
                         mask,
                         kv_channels,
                         heads,
+                        is_training,
                         dropout=0.0,
                         dropout_broadcast_dims=None,
                         master_dtype=tf.float32,
@@ -1653,6 +1711,7 @@ def multihead_attention(query_antecedent,
     mask: mask Tensor (see attention_mask())
     kv_channels: a mtf.Dimension (the size of the key and value vectors)
     heads: a mtf.Dimension (the number of heads)
+    is_training: a bool, is True while training, false otherwise.
     dropout: a floating point value
     dropout_broadcast_dims: an optional list of mtf.Dimension
     master_dtype: a tf.dtype
@@ -1692,7 +1751,7 @@ def multihead_attention(query_antecedent,
         [memory_antecedent, wv],
         mtf.Shape(batch_dims + [heads, memory_length, kv_channels]))
     o = dot_product_attention(
-        q, k, v, mask, dropout, dropout_broadcast_dims)
+        q, k, v, mask, is_training, dropout, dropout_broadcast_dims)
     return mtf.einsum(
         [o, wo], mtf.Shape(batch_dims + [query_length, io_channels]))
 
@@ -1756,7 +1815,7 @@ def multihead_self_attention_incremental(query_antecedent,
         mtf.greater(mtf.range(
             query_antecedent.mesh, memory_length, dtype=tf.int32), step_num),
         q.dtype) * -1e9
-    o = dot_product_attention(q, k, v, mask)
+    o = dot_product_attention(q, k, v, mask, is_training=False)
     y = mtf.einsum([o, wo], query_antecedent.shape)
     return y, k, v
 
@@ -1792,7 +1851,7 @@ def multihead_encdec_attention_incremental(query_antecedent,
     q = mtf.einsum(
         [query_antecedent, wq],
         mtf.Shape(query_dims + [heads, kv_channels]))
-    o = dot_product_attention(q, k, v, mask)
+    o = dot_product_attention(q, k, v, mask, is_training=False)
     return mtf.einsum([o, wo], query_antecedent.shape)
 
 
@@ -1931,6 +1990,7 @@ def multihead_self_attention_memory_compressed(x,
                                                compression_factor,
                                                kv_channels,
                                                heads,
+                                               is_training,
                                                dropout=0.0,
                                                dropout_broadcast_dims=None,
                                                master_dtype=tf.float32,
@@ -1948,6 +2008,7 @@ def multihead_self_attention_memory_compressed(x,
     compression_factor: an integer
     kv_channels: a mtf.Dimension (the size of the key and value vectors)
     heads: a mtf.Dimension (the number of heads)
+    is_training: a boolean, set to true while training
     dropout: a floating point value
     dropout_broadcast_dims: an optional list of mtf.Dimension
     master_dtype: a tf.dtype
@@ -1989,7 +2050,8 @@ def multihead_self_attention_memory_compressed(x,
     else:
       mask = None
     o = dot_product_attention(
-        q, k, v, mask, dropout, dropout_broadcast_dims, extra_logit=0.0)
+        q, k, v, mask, is_training, dropout, dropout_broadcast_dims,
+        extra_logit=0.0)
     return mtf.einsum(
         [o, wo], mtf.Shape(batch_dims + [length, io_channels]))
 
@@ -2210,3 +2272,66 @@ def reversible_half_residual_and_swap(x1,
         [x1, x1_backwards, x2, x2_backwards])
   else:
     return _half_residual_and_swap(x1, x1_backwards, x2, x2_backwards, f)
+
+
+@gin.configurable
+def clip_activation_gradient(x, clip_rms_norm=None):
+  """Clip activation gradients by rms-norm."""
+  tf.logging.info("clip_activation_gradient.clip_rms_norm: {}".format(
+      clip_rms_norm))
+
+  def _reduce_rms(t):
+    return mtf.sqrt(mtf.reduce_mean(mtf.square(t)))
+
+  def forward_fn(x):
+    """Identity forward pass."""
+    summary_for_clip_activation_gradient(x, "forward_act", x.shape[:-1])
+    return mtf.identity(x)
+
+  def grad_fn(explicit_inputs, all_inputs, forward_operations, outputs,
+              output_grads):
+    del explicit_inputs, all_inputs, outputs, forward_operations
+
+    grad_ys = output_grads
+    if clip_rms_norm:
+      clipped_grad_ys = []
+      for g in grad_ys:
+        rms_norm = _reduce_rms(g)
+        clipping_denom = mtf.maximum(1.0, rms_norm / clip_rms_norm)
+        clipped_grad_ys.append(g / clipping_denom)
+      return clipped_grad_ys
+    return grad_ys
+
+  explicit_inputs = [x]
+
+  return mtf.custom_gradient(forward_fn, grad_fn, explicit_inputs)
+
+
+def annealed_dropout(x, is_training, start_step, end_step,
+                     init_rate=None, noise_shape=None, name=None):
+  """Linearly anneal the dropout rate between start_step and end_step."""
+  cur_step = tf.train.get_or_create_global_step()
+  cur_step = tf.cast(cur_step, tf.float32)
+  start_step = tf.cast(start_step, tf.float32)
+  end_step = tf.cast(end_step, tf.float32)
+  fraction_complete = (cur_step - start_step) / (end_step - start_step)
+  annealed_prob = (1.0 - init_rate) + fraction_complete * init_rate
+  keep_prob = tf.minimum(annealed_prob, 1.0)
+  keep_prob = tf.cast(keep_prob, dtype=x.dtype)
+
+  noise_shape = mtf.convert_to_shape(noise_shape)
+  if noise_shape is None:
+    noise_shape = x.shape
+  with tf.variable_scope(name, default_name="dropout"):
+    if keep_prob == 1.0 or not is_training:
+      return x
+    noise = mtf.cast(
+        mtf.less(
+            mtf.random_uniform(
+                x.mesh,
+                noise_shape,
+                dtype=(x.dtype if x.dtype.is_floating else tf.float32)),
+            keep_prob), x.dtype)
+    if x.dtype.is_floating:
+      noise /= keep_prob
+    return x * noise

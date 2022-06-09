@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The Mesh TensorFlow Authors.
+# Copyright 2022 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -79,7 +79,7 @@ class MtfUnetDataAugTest(tf.test.TestCase):
 
       image_3d_aug, label_3d_aug = \
           data_aug_lib.maybe_gen_fake_data_based_on_real_data(
-              image_3d, label_3d, reso=2,
+              image_3d, label_3d, reso=32,
               min_fake_lesion_ratio=0.0, gen_fake_probability=0.0)
 
       image_3d_aug_np = sess.run(image_3d_aug)

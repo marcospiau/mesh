@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The Mesh TensorFlow Authors.
+# Copyright 2022 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ from __future__ import division
 from __future__ import print_function
 
 import copy
+import functools
 import math
 import gin
 
@@ -64,7 +65,7 @@ class DenseReluDense(transformer.TransformerLayer):
                                  name="wi",
                                  expert_dims=context.model.ensemble_dims)
     if context.train and self.dropout_rate != 0.0:
-      h = mtf.dropout(h, 1.0 - self.dropout_rate,
+      h = mtf.dropout(h, context.train, keep_prob=1.0 - self.dropout_rate,
                       noise_shape=h.shape - context.length_dim)
     return mtf.layers.dense(h, io_channels,
                             use_bias=self.use_bias,
@@ -164,7 +165,14 @@ class SelfAttention(transformer.TransformerLayer):
                attention_func=None,
                combine_dims=True,
                keep_query_heads_dims=False,
-               fold_scaling_into_initializer=True):
+               fold_scaling_into_initializer=True,
+               z_loss_coeff=None,
+               use_hyperprompt=False,
+               hyperprompt_mtlshare=False,
+               hyperprompt_length_encoder=None,
+               hyperprompt_length_decoder=None,
+               hyperprompt_hidden_dim=None,
+               hyperprompt_task_num=8):
     """Create a SelfAttention Layer.
 
     Args:
@@ -181,6 +189,24 @@ class SelfAttention(transformer.TransformerLayer):
       combine_dims: a boolean
       keep_query_heads_dims: a boolean
       fold_scaling_into_initializer: a boolean
+      z_loss_coeff: a float, if z_loss_coeff is not None then add an auxiliary
+        loss to push the attention logits closer to zero. This helps to
+        stabilize model training.
+      use_hyperprompt: a boolean, whether to use hypernetwork to enable the info
+        sharing among task-prompts. Otherwise, MTL-Prompt is enabled if either
+        hyperprompt_length_encoder or hyperprompt_length_decoder is not None.
+      hyperprompt_mtlshare: a boolean, whether to share MTL-Prompt project
+        networks among tasks if MTL-Prompt is activate. Otherwise, each task has
+        its own project network (MTL-Prompt-Sep).
+      hyperprompt_length_encoder: an integer, the length of task embeddings
+        prepended to the keys and values in encoder. If it is None, prompts are
+        not prepended in the encoder.
+      hyperprompt_length_decoder: aan integer, the length of task embeddings
+        prepended to the keys and values in decoder. If it is None, prompts are
+        not prepended in the decoder.
+      hyperprompt_hidden_dim: the bottleneck dimension in MLPs to generate
+        hyper-prompts.
+      hyperprompt_task_num: an integer, # of tasks in hyperprompt mode.
     """
     self.num_heads = num_heads
     self.num_memory_heads = num_memory_heads
@@ -194,6 +220,13 @@ class SelfAttention(transformer.TransformerLayer):
     self.combine_dims = combine_dims
     self.keep_query_heads_dims = keep_query_heads_dims
     self.fold_scaling_into_initializer = fold_scaling_into_initializer
+    self.z_loss_coeff = z_loss_coeff
+    self.use_hyperprompt = use_hyperprompt
+    self.hyperprompt_mtlshare = hyperprompt_mtlshare
+    self.hyperprompt_length_encoder = hyperprompt_length_encoder
+    self.hyperprompt_length_decoder = hyperprompt_length_decoder
+    self.hyperprompt_hidden_dim = hyperprompt_hidden_dim
+    self.hyperprompt_task_num = hyperprompt_task_num
 
   def layer_output_from_attention_output(self, context, attention_output,
                                          losses):
@@ -241,7 +274,7 @@ class SelfAttention(transformer.TransformerLayer):
           context.position, memory_length, dtype=context.activation_dtype)
       inv_one_hot = 1.0 - one_hot
       if self.shared_kv:
-        old_kv = context.get_states(1)
+        old_kv, = context.get_states(1)
         kv = old_kv * inv_one_hot + kv * one_hot
       else:
         old_k, old_v = context.get_states(2)
@@ -256,11 +289,60 @@ class SelfAttention(transformer.TransformerLayer):
     if self.shared_kv:
       k = kv
       v = kv
+
+    # Inject hyper-prompts into k and v, skipped when prompt length is None.
+    scope_encoder_or_decoder = tf.get_variable_scope().name.split("/")[0]
+    use_prompt_kv = None
+    if self.hyperprompt_length_encoder and scope_encoder_or_decoder == "encoder":
+      k, v, memory_position, memory_length = attention.concat_hyper_prompts_kv(
+          k,
+          v,
+          scope_encoder_or_decoder,
+          self.use_hyperprompt,
+          memory_length,
+          self.hyperprompt_task_num,
+          self.num_heads,
+          self.hyperprompt_hidden_dim,
+          self.kv_dim,
+          context,
+          self.hyperprompt_mtlshare,
+          self.dropout_rate,
+          prompt_length=self.hyperprompt_length_encoder)
+      use_prompt_kv = "encoder_prompts"
+
+    if self.hyperprompt_length_decoder and scope_encoder_or_decoder == "decoder":
+      k, v, memory_position, memory_length = attention.concat_hyper_prompts_kv(
+          k,
+          v,
+          scope_encoder_or_decoder,
+          self.use_hyperprompt,
+          memory_length,
+          self.hyperprompt_task_num,
+          self.num_heads,
+          self.hyperprompt_hidden_dim,
+          self.kv_dim,
+          context,
+          self.hyperprompt_mtlshare,
+          self.dropout_rate,
+          prompt_length=self.hyperprompt_length_decoder)
+      use_prompt_kv = "decoder_prompts"
+
     o = self.attention_fn(
-        q, k, v, context=context, memory_length_dim=memory_length,
-        key_dim=self.kv_dim, value_dim=self.kv_dim,
-        bias=self.compute_bias(context, memory_position, x,
-                               params.query_heads_dims, q),
+        q,
+        k,
+        v,
+        context=context,
+        memory_length_dim=memory_length,
+        key_dim=self.kv_dim,
+        value_dim=self.kv_dim,
+        bias=self.compute_bias(
+            context,
+            memory_position,
+            x,
+            params.query_heads_dims,
+            q,
+            use_prompt_kv=use_prompt_kv),
+        z_loss_coeff=self.z_loss_coeff,
         **self.attention_kwargs_from_context(context))
     attention_output_shape = self.expected_attention_output_shape(x, params)
     attention_output = params.compute_output(
@@ -268,7 +350,13 @@ class SelfAttention(transformer.TransformerLayer):
     return self.layer_output_from_attention_output(context, attention_output,
                                                    losses)
 
-  def compute_bias(self, context, memory_position, x, heads_dims, q):
+  def compute_bias(self,
+                   context,
+                   memory_position,
+                   x,
+                   heads_dims,
+                   q,
+                   use_prompt_kv=None):
     """Compute attention bias.
 
     Args:
@@ -277,13 +365,21 @@ class SelfAttention(transformer.TransformerLayer):
       x: a Tensor - the query antecedent - required for relative attention
       heads_dims: a list of dimensions
       q: a Tensor - the queries - required for contextual relative attention
+      use_prompt_kv: a string, "encoder_prompts" is to add prompts in encoder
+        "decoder_prompts" is to add prompt in decoder, which affects biases.
+
     Returns:
       a Tensor or None
     """
-    min_relative_position = self.min_relative_position(context)
-    max_relative_position = self.max_relative_position(context)
+    min_relative_position = self.min_relative_position(context)  # pylint: disable=assignment-from-none
+    max_relative_position = self.max_relative_position(context)  # pylint: disable=assignment-from-none
     biases = []
     relative_position = memory_position - context.position
+    if use_prompt_kv == "encoder_prompts":
+      relative_position -= self.hyperprompt_length_encoder
+    elif use_prompt_kv == "decoder_prompts":
+      relative_position -= self.hyperprompt_length_decoder
+
     if min_relative_position is not None:
       visible = mtf.greater_equal(relative_position, min_relative_position)
       biases.append(attention.visibility_mask_to_attention_bias(
@@ -293,9 +389,21 @@ class SelfAttention(transformer.TransformerLayer):
       biases.append(attention.visibility_mask_to_attention_bias(
           visible, context.activation_dtype))
     if context.read_priority is not None:
-      visible = mtf.greater_equal(
-          context.read_priority,
-          mtf.layers.rename_length_to_memory_length(context.write_priority))
+      if use_prompt_kv == "decoder_prompts":
+        prompt_length_dim = mtf.Dimension(context.length_dim.name,
+                                          self.hyperprompt_length_decoder)
+        write_priority_memory = mtf.ones(
+            x.mesh, shape=[prompt_length_dim], dtype=tf.int32) * -1
+        write_priority = mtf.concat(
+            [write_priority_memory, context.write_priority],
+            concat_dim_name=context.length_dim.name)
+        visible = mtf.greater_equal(
+            context.read_priority,
+            mtf.layers.rename_length_to_memory_length(write_priority))
+      else:
+        visible = mtf.greater_equal(
+            context.read_priority,
+            mtf.layers.rename_length_to_memory_length(context.write_priority))
       biases.append(attention.visibility_mask_to_attention_bias(
           visible, context.activation_dtype))
 
@@ -308,9 +416,22 @@ class SelfAttention(transformer.TransformerLayer):
     elif isinstance(context.sequence_id, mtf.Tensor):
       sequence_id = context.sequence_id
     if (sequence_id is not None and context.length_dim in sequence_id.shape):
-      visible = mtf.equal(
-          sequence_id,
-          self.rename_length_to_memory_length(sequence_id, context))
+      if use_prompt_kv:
+        if use_prompt_kv == "decoder_prompts":
+          memory_length = mtf.Dimension(
+              "memory_length",
+              context.length_dim.size + self.hyperprompt_length_decoder)
+        elif use_prompt_kv == "encoder_prompts":
+          memory_length = mtf.Dimension(
+              "memory_length",
+              context.length_dim.size + self.hyperprompt_length_encoder)
+        memory_sequence_id = mtf.ones(
+            x.mesh, shape=[x.shape.dims[0], memory_length], dtype=tf.int32)
+        visible = mtf.equal(sequence_id, memory_sequence_id)
+      else:
+        visible = mtf.equal(
+            sequence_id,
+            self.rename_length_to_memory_length(sequence_id, context))
       biases.append(attention.visibility_mask_to_attention_bias(
           visible, context.activation_dtype))
     if self.relative_attention_type is not None:
@@ -390,16 +511,19 @@ class ExpertsSelfAttention(SelfAttention):
                capacity_factor_eval=2.0,
                moe_gating="switch",
                min_expert_capacity=4,
-               rand_1_policy_train="input_jitter",
-               rand_1_policy_eval="input_jitter",
-               rand_1_dropout=0.0,
-               rand_1_temperature=1.0,
-               rand_1_jitter=1e-2,
-               switch_top_k=4,
+               switch_policy_train="input_jitter",
+               switch_policy_eval="input_jitter",
+               switch_dropout=0.0,
+               switch_temperature=1.0,
+               switch_jitter=1e-2,
+               ntlb_top_k=4,
                hidden_size=3072,
-               use_experts_attention=True,
+               activation="relu",
+               z_loss=None,
+               expert_computation="qkv",
                **kwargs):
     super(ExpertsSelfAttention, self).__init__(**kwargs)
+    self.expert_computation = expert_computation
     self._hparams = mtf.transformer.moe.HParams(
         moe_gating=moe_gating,
         num_experts=num_experts,
@@ -408,14 +532,15 @@ class ExpertsSelfAttention(SelfAttention):
         min_expert_capacity=min_expert_capacity,
         capacity_factor_train=capacity_factor_train,
         capacity_factor_eval=capacity_factor_eval,
-        rand_1_policy_train=rand_1_policy_train,
-        rand_1_policy_eval=rand_1_policy_eval,
-        rand_1_dropout=rand_1_dropout,
-        rand_1_temperature=rand_1_temperature,
-        rand_1_jitter=rand_1_jitter,
-        switch_top_k=switch_top_k,
+        switch_policy_train=switch_policy_train,
+        switch_policy_eval=switch_policy_eval,
+        switch_dropout=switch_dropout,
+        switch_temperature=switch_temperature,
+        switch_jitter=switch_jitter,
+        ntlb_top_k=ntlb_top_k,
         hidden_size=hidden_size,
-        use_experts_attention=use_experts_attention)
+        activation=activation,
+        z_loss=z_loss)
 
   def make_params(self, context):
     num_heads = self.num_heads
@@ -453,7 +578,8 @@ class ExpertsSelfAttention(SelfAttention):
         keep_query_heads_dims=self.keep_query_heads_dims,
         fold_scaling_into_initializer=self.fold_scaling_into_initializer,
         context=context,
-        experts_hparams=self._hparams)
+        experts_hparams=self._hparams,
+        expert_computation=self.expert_computation)
 
 
 @gin.configurable
@@ -719,7 +845,8 @@ def enc_dec_attention_bias(layer,
 
 @gin.configurable
 def enc_dec_attention(self_attention_layer, memory_antecedent, context, x,
-                      losses, attention_fn=attention.attention):
+                      losses, attention_fn=attention.attention,
+                      z_loss_coeff=None):
   """Multi-head attention over the encoder outputs."""
   memory_input_dim = memory_antecedent.shape[-1]
   if memory_input_dim != context.model.model_dim:
@@ -748,6 +875,7 @@ def enc_dec_attention(self_attention_layer, memory_antecedent, context, x,
       q, k, v, memory_length, self_attention_layer.kv_dim,
       self_attention_layer.kv_dim, bias,
       context=context,
+      z_loss_coeff=z_loss_coeff,
       **self_attention_layer.attention_kwargs_from_context(context))
   attention_output_shape = self_attention_layer.expected_attention_output_shape(
       x, params)
@@ -772,7 +900,8 @@ class EncDecAttention(SelfAttention):
     """Call the layer."""
     return enc_dec_attention(self, self._get_memory_antecedent(context),
                              context, x, losses,
-                             attention_fn=self.attention_fn)
+                             attention_fn=self.attention_fn,
+                             z_loss_coeff=self.z_loss_coeff)
 
   @property
   def attention_fn(self):
@@ -857,8 +986,7 @@ class TransparentEncDecAttention(EncDecAttention):
         mtf.Shape([encoder_module_outputs_dim, decoder_module_inputs_dim]),
         initializer=tf.random_normal_initializer(stddev=stddev),
         dtype=context.variable_dtype)
-    if context.train and self.dropout_rate != 0.0:
-      w = mtf.dropout(w, 1.0 - self.dropout_rate)
+    w = mtf.dropout(w, context.train, 1.0 - self.dropout_rate)
     s = mtf.softmax(w, reduced_dim=encoder_module_outputs_dim)
     z = mtf.layers.us_einsum([s, encoder_module_outputs],
                              reduced_dims=[encoder_module_outputs_dim])
@@ -1253,7 +1381,7 @@ class TalkingHeadsSelfAttention(SelfAttention):
     # TODO(noam): make dropout_broadcast_dims configurable
     dropout_broadcast_dims = [context.length_dim]
     weights = mtf.dropout(
-        weights, rate=self.dropout_rate if context.train else 0.0,
+        weights, context.train, rate=self.dropout_rate,
         noise_shape=weights.shape - dropout_broadcast_dims)
     u = mtf.einsum([weights, v], reduced_dims=[memory_length])
     return self.compute_y(context, u)
@@ -1440,7 +1568,8 @@ class GeneralBilinearSelfAttention(SelfAttention):
     # TODO(noam): make dropout_broadcast_dims configurable
     dropout_broadcast_dims = [context.length_dim]
     weights = mtf.dropout(
-        weights, rate=self.dropout_rate if context.train else 0.0,
+        weights, context.train,
+        rate=self.dropout_rate,
         noise_shape=weights.shape - dropout_broadcast_dims)
     u = mtf.einsum([weights, m], reduced_dims=[memory_length])
     return self.compute_y(context, u)
@@ -1708,7 +1837,7 @@ class Conv1DLayer(Conv1D):
   across packed examples.
   """
 
-  def __init__(self, filter_size, output_size, activation="linear"):
+  def __init__(self, filter_size, output_size, activation="linear"):  # pylint: disable=super-init-not-called
     """Create a Conv1DLayer.
 
     Args:
@@ -1774,7 +1903,7 @@ class SeparableConv1DLayer(Conv1D):
   across packed examples.
   """
 
-  def __init__(self,
+  def __init__(self,  # pylint: disable=super-init-not-called
                min_relative_pos,
                max_relative_pos,
                output_size,
@@ -2096,3 +2225,42 @@ class LocalConvAttnBlock(transformer.TransformerLayer):
         name="local_conv_attn_op_projection")
 
     return op_projection
+
+
+@gin.configurable
+class ParallelLayer(transformer.TransformerLayer):
+  """Multiple layers in parallel.
+
+  Outputs are summed and divided by sqrt(n).
+  """
+
+  def __init__(self,
+               layer_classes=(DenseReluDense, SelfAttention),
+               use_scope=True):
+    """Create a ParallelLayer.
+
+    Args:
+      layer_classes: a list of TransformerLayer classes
+      use_scope: boolean, default True, which indicates whether to use unique
+        variable names for each parallel_layer. Here for backward compatibility.
+    """
+    self.layer_classes = [l() for l in layer_classes]
+    self.use_scope = use_scope
+
+  def call(self, context, x, losses=None):
+    """Call the layer."""
+    layer_outputs = []
+
+    if self.use_scope:
+      # Provide unique variable name scopes to avoid overwriting.
+      for i, l in enumerate(self.layer_classes):
+        with tf.variable_scope("parallel_layer_%d" % i):
+          layer_output = l.call(context, x, losses=losses)
+          layer_outputs.append(layer_output)
+    else:
+      layer_outputs = [
+          l.call(context, x, losses=losses) for l in self.layer_classes
+      ]
+    return mtf.add_n(layer_outputs) * (len(self.layer_classes)**-0.5)
+
+

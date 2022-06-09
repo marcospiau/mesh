@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The Mesh TensorFlow Authors.
+# Copyright 2022 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,13 +20,13 @@ from __future__ import division
 from __future__ import print_function
 
 from absl.testing import parameterized
-
 import mesh_tensorflow as mtf
 from mesh_tensorflow import test_utils
 import mock
 import numpy as np
-
 import tensorflow.compat.v1 as tf
+import tensorflow_probability as tfp
+
 from tensorflow.python.framework import test_util  # pylint:disable=g-direct-tensorflow-import
 
 
@@ -84,6 +84,68 @@ class LayersTest(parameterized.TestCase, tf.test.TestCase):
     actual, expected = self.evaluate([actual_outputs, expected_outputs])
 
     self.assertEqual(actual.shape, expected.shape)
+
+  @test_util.run_in_graph_and_eager_modes()
+  def testCorr2DInput(self):
+    batch = 4
+    channels = 3
+    inputs = tf.random_normal([batch, channels])
+
+    graph = mtf.Graph()
+    mesh = mtf.Mesh(graph, "my_mesh")
+    batch_dim = mtf.Dimension("batch", batch)
+    channels_dim = mtf.Dimension("channels", channels)
+
+    mtf_inputs = mtf.import_tf_tensor(
+        mesh, inputs, shape=mtf.Shape([batch_dim, channels_dim]))
+    mtf_outputs = mtf.layers.corr(mtf_inputs, dim=channels_dim)
+    mesh_impl = mtf.placement_mesh_impl.PlacementMeshImpl(
+        shape=[], layout={}, devices=[""])
+    lowering = mtf.Lowering(graph, {mesh: mesh_impl})
+    actual_outputs = lowering.export_to_tf_tensor(mtf_outputs)
+
+    expected_outputs = tfp.stats.correlation(
+        inputs, sample_axis=0, event_axis=1)
+    tf_group = lowering.copy_masters_to_slices()
+    init = tf.global_variables_initializer()
+    self.evaluate(init)
+    self.evaluate(tf_group)
+    actual, expected = self.evaluate([actual_outputs, expected_outputs])
+
+    self.assertEqual(actual.shape, expected.shape)
+    self.assertAllClose(actual, expected)
+
+  @test_util.run_in_graph_and_eager_modes()
+  def testCorr3DInput(self):
+    batch = 4
+    sequence = 5
+    channels = 3
+    inputs = tf.random_normal([batch, sequence, channels])
+
+    graph = mtf.Graph()
+    mesh = mtf.Mesh(graph, "my_mesh")
+    batch_dim = mtf.Dimension("batch", batch)
+    seq_dim = mtf.Dimension("seq", sequence)
+    channels_dim = mtf.Dimension("channels", channels)
+
+    mtf_inputs = mtf.import_tf_tensor(
+        mesh, inputs, shape=mtf.Shape([batch_dim, seq_dim, channels_dim]))
+    mtf_outputs = mtf.layers.corr(mtf_inputs, dim=channels_dim)
+    mesh_impl = mtf.placement_mesh_impl.PlacementMeshImpl(
+        shape=[], layout={}, devices=[""])
+    lowering = mtf.Lowering(graph, {mesh: mesh_impl})
+    actual_outputs = lowering.export_to_tf_tensor(mtf_outputs)
+
+    expected_outputs = tfp.stats.correlation(
+        inputs, sample_axis=[0, 1], event_axis=2)
+    tf_group = lowering.copy_masters_to_slices()
+    init = tf.global_variables_initializer()
+    self.evaluate(init)
+    self.evaluate(tf_group)
+    actual, expected = self.evaluate([actual_outputs, expected_outputs])
+
+    self.assertEqual(actual.shape, expected.shape)
+    self.assertAllClose(actual, expected)
 
   @test_util.run_in_graph_and_eager_modes()
   def testLayerNorm(self):
@@ -194,7 +256,8 @@ class LayersTest(parameterized.TestCase, tf.test.TestCase):
     mtf_inputs = mtf.import_tf_tensor(
         mesh, inputs, shape=mtf.Shape([batch_dim, channels_dim]))
     mtf_outputs = mtf.layers.dense_relu_dense(mtf_inputs,
-                                              hidden_channels=hidden_dim)
+                                              hidden_channels=hidden_dim,
+                                              is_training=False)
     mesh_impl = mtf.placement_mesh_impl.PlacementMeshImpl(
         shape=[], layout={}, devices=[""])
     lowering = mtf.Lowering(graph, {mesh: mesh_impl})
@@ -232,6 +295,7 @@ class LayersTest(parameterized.TestCase, tf.test.TestCase):
         mtf_query,
         kv_channels=kv_channels_dim,
         heads=heads_dim,
+        is_training=False,
         window_size=window_size)
     mesh_impl = mtf.placement_mesh_impl.PlacementMeshImpl(
         shape=[], layout={}, devices=[""])
@@ -280,7 +344,8 @@ class LayersTest(parameterized.TestCase, tf.test.TestCase):
         mtf_query,
         mtf_key,
         mtf_value,
-        mask=None)
+        mask=None,
+        is_training=False)
     mesh_impl = mtf.placement_mesh_impl.PlacementMeshImpl(
         shape=[], layout={}, devices=[""])
     lowering = mtf.Lowering(graph, {mesh: mesh_impl})
@@ -320,7 +385,8 @@ class LayersTest(parameterized.TestCase, tf.test.TestCase):
         memory_antecedent=None,
         mask=None,
         kv_channels=kv_channels_dim,
-        heads=heads_dim)
+        heads=heads_dim,
+        is_training=False)
     mesh_impl = mtf.placement_mesh_impl.PlacementMeshImpl(
         shape=[], layout={}, devices=[""])
     lowering = mtf.Lowering(graph, {mesh: mesh_impl})

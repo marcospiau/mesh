@@ -5,7 +5,7 @@ from setuptools import setup
 
 setup(
     name='mesh-tensorflow',
-    version='0.1.18',
+    version='0.1.21',
     description='Mesh TensorFlow',
     author='Google Inc.',
     author_email='no-reply@google.com',
@@ -27,6 +27,7 @@ setup(
         'auto_mtf': ['ortools'],
         'tensorflow': ['tensorflow>=1.15.0'],
         'transformer': ['tensorflow-datasets', 'scipy'],
+        'test': ['tensorflow_probability']
     },
     tests_require=[
         'ortools',

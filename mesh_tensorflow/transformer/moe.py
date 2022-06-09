@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The Mesh TensorFlow Authors.
+# Copyright 2022 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -53,14 +53,19 @@ class MoE1D(transformer.TransformerLayer):
                activation="relu",
                moe_gating="top_2",
                min_expert_capacity=4,
-               rand_1_policy_train="input_jitter",
-               rand_1_policy_eval="input_jitter",
-               rand_1_dropout=0.1,
-               rand_1_temperature=1.0,
-               rand_1_jitter=1e-2,
-               switch_top_k=4,
+               switch_policy_train="input_jitter",
+               switch_policy_eval="input_jitter",
+               switch_dropout=0.1,
+               switch_temperature=1.0,
+               switch_jitter=1e-2,
+               ntlb_top_k=4,
                output_dim=None,
-               use_experts_attention=False):
+               use_experts_attention=False,
+               z_loss=None,
+               word_embed_mode=None,
+               use_second_place_expert_prob=None,
+               use_second_place_expert_prob_temp=None,
+               top_n_num_experts_per_token=3):
     self._hparams = HParams(
         moe_gating=moe_gating,
         moe_num_experts=num_experts,
@@ -76,14 +81,21 @@ class MoE1D(transformer.TransformerLayer):
         moe_second_threshold_train=second_threshold_train,
         moe_second_threshold_eval=second_threshold_eval,
         moe_dropout_rate=dropout_rate,
-        moe_rand_1_policy_train=rand_1_policy_train,
-        moe_rand_1_policy_eval=rand_1_policy_eval,
-        moe_rand_1_dropout=rand_1_dropout,
-        moe_rand_1_temperature=rand_1_temperature,
-        moe_rand_1_jitter=rand_1_jitter,
+        moe_switch_policy_train=switch_policy_train,
+        moe_switch_policy_eval=switch_policy_eval,
+        moe_switch_dropout=switch_dropout,
+        moe_switch_temperature=switch_temperature,
+        moe_switch_jitter=switch_jitter,
         moe_output_dim=output_dim,
-        moe_switch_top_k=switch_top_k,
-        moe_use_experts_attention=use_experts_attention)
+        moe_ntlb_top_k=ntlb_top_k,
+        moe_use_experts_attention=use_experts_attention,
+        moe_z_loss=z_loss,
+        moe_word_embed_mode=word_embed_mode,
+        moe_use_second_place_expert_prob=(
+            use_second_place_expert_prob),
+        moe_use_second_place_expert_prob_temp=(
+            use_second_place_expert_prob_temp),
+        moe_top_n_num_experts_per_token=top_n_num_experts_per_token)
     self._activation = activation
 
   def call(self, context, x, losses=None):
@@ -114,7 +126,8 @@ class MoE1D(transformer.TransformerLayer):
         mesh_shape=context.model.mesh_shape,
         nonpadding=context.nonpadding,
         activation=self._activation,
-        num_microbatches=context.num_microbatches)
+        num_microbatches=context.num_microbatches,
+        token_embeddings=context.input_embeddings)
     if context.losses is not None:
       context.losses.append(loss)
     if not has_length_dim:
@@ -189,7 +202,7 @@ class MoE2D(transformer.TransformerLayer):
 def transformer_moe_layer_v1(
     inputs, output_dim, hparams, train, variable_dtype,
     layout=None, mesh_shape=None, nonpadding=None, activation=mtf.relu,
-    num_microbatches=None):
+    num_microbatches=None, token_embeddings=None):
   """Local mixture of experts that works well on TPU.
 
   Adapted from the paper https://arxiv.org/abs/1701.06538
@@ -264,6 +277,10 @@ def transformer_moe_layer_v1(
       and zeros(padding).
     activation: a function.
     num_microbatches: number of microbatches.
+    token_embeddings: a mtf.Tensor with shape
+      [batch_dim(s), length_dim, input_dim]. These are the word embeddings for
+      that correspond to the inputs. These can optionally be used to make
+      routing decisions.
 
   Returns:
     outputs: a Tensor with shape [batch_dim(s), length_dim, output_dim]
@@ -358,6 +375,12 @@ def transformer_moe_layer_v1(
   # OGSM Tensor
   inputs = mtf.reshape(inputs, moe_input_dims)
 
+  # Token embeddings that can be optionally used in the router for determining
+  # where to send tokens.
+  if hparams.moe_word_embed_mode is not None:
+    token_embeddings = mtf.cast(
+        mtf.reshape(token_embeddings, moe_input_dims), inputs.dtype)
+
   # Each sequence sends expert_capacity positions to each expert.
   if train:
     capacity_factor = hparams.moe_capacity_factor_train
@@ -388,9 +411,10 @@ def transformer_moe_layer_v1(
         train=train,
         variable_dtype=variable_dtype,
         importance=nonpadding,
-        num_microbatches=num_microbatches)
-  elif hparams.moe_gating == "rand_1":
-    dispatch_tensor, combine_tensor, loss = _rand_1_gating(
+        num_microbatches=num_microbatches,
+        token_embeddings=token_embeddings)
+  elif hparams.moe_gating == "top_n":
+    dispatch_tensor, combine_tensor, loss = _top_n_gating(
         inputs=inputs,
         outer_expert_dims=None,
         experts_dim=experts_dim_unsplit,
@@ -399,7 +423,8 @@ def transformer_moe_layer_v1(
         train=train,
         variable_dtype=variable_dtype,
         importance=nonpadding,
-        num_microbatches=num_microbatches)
+        num_microbatches=num_microbatches,
+        token_embeddings=token_embeddings)
   elif hparams.moe_gating == "switch":
     dispatch_tensor, combine_tensor, loss = _switch_gating(
         inputs=inputs,
@@ -410,7 +435,46 @@ def transformer_moe_layer_v1(
         train=train,
         variable_dtype=variable_dtype,
         importance=nonpadding,
-        num_microbatches=num_microbatches)
+        num_microbatches=num_microbatches,
+        token_embeddings=token_embeddings)
+  elif hparams.moe_gating == "ntlb":
+    dispatch_tensor, combine_tensor, loss = _ntlb_gating(
+        inputs=inputs,
+        outer_expert_dims=None,
+        experts_dim=experts_dim_unsplit,
+        expert_capacity_dim=expert_capacity_dim,
+        hparams=hparams,
+        train=train,
+        variable_dtype=variable_dtype,
+        importance=nonpadding,
+        num_microbatches=num_microbatches,
+        token_embeddings=token_embeddings)
+  elif hparams.moe_gating == "switch_max":
+    dispatch_tensor, combine_tensor, loss = _switch_max_gating(
+        inputs=inputs,
+        outer_expert_dims=None,
+        experts_dim=experts_dim_unsplit,
+        expert_capacity_dim=expert_capacity_dim,
+        hparams=hparams,
+        train=train,
+        variable_dtype=variable_dtype,
+        importance=nonpadding,
+        num_microbatches=num_microbatches,
+        token_embeddings=token_embeddings)
+  elif hparams.moe_gating == "expert_selection":
+    dispatch_tensor, combine_tensor, loss = _expert_selection_gating(
+        inputs=inputs,
+        outer_expert_dims=None,
+        experts_dim=experts_dim_unsplit,
+        group_size_dim=group_size_dim,
+        expert_capacity_dim=expert_capacity_dim,
+        hparams=hparams,
+        train=train,
+        variable_dtype=variable_dtype,
+        importance=nonpadding,
+        name="expert_selection_gating",
+        num_microbatches=num_microbatches,
+        token_embeddings=token_embeddings)
   else:
     raise ValueError("unknown hparams.moe_gating=%s" % hparams.moe_gating)
 
@@ -448,8 +512,9 @@ def transformer_moe_layer_v1(
       activation_functions=activation, use_bias=False,
       variable_dtype=variable_dtype, name="wi")
 
-  if train and hparams.moe_dropout_rate != 0.0:
-    h = mtf.dropout(h, 1.0 - hparams.moe_dropout_rate)
+  if hparams.moe_dropout_rate != 0.0:
+    h = mtf.dropout(h, is_training=train,
+                    keep_prob=1.0 - hparams.moe_dropout_rate)
 
   def _compute_output(hidden, layer_name):
     """Compute the output of the attention layer from the hidden vector."""
@@ -461,6 +526,8 @@ def transformer_moe_layer_v1(
     # Extra reshape reduces communication cost for model-parallel versions.
     # For model-parallel versions, this reshape causes an mtf.slice and for non-
     # model-parallel versions, this has no effect.
+    d_model_split_dim = mtf.Dimension(
+        "d_model_split", expert_output.shape[-1].size)
     expert_output = mtf.reshape(
         expert_output,
         mtf.Shape([
@@ -774,34 +841,85 @@ def transformer_moe_layer_v2(
   return output, (loss_outer + loss_inner) * hparams.moe_loss_coef
 
 
-def _switch_gating(inputs,
-                   outer_expert_dims,
-                   experts_dim,
-                   expert_capacity_dim,
-                   hparams,
-                   train,
-                   variable_dtype,
-                   importance=None,
-                   name="switch_gating",
-                   num_microbatches=None):
-  """Compute a switch top-1 gating with no-token-left behind behavior."""
+def _stochastically_use_non_top_expert(gate_logits, experts_dim, hparams):
+  """With a specified probability use the second place or lower experts."""
+  # With the specified probability use the second place expert in place of the
+  # top expert.
+  tf.logging.info("Using second place expert with prob: {}".format(
+      hparams.moe_use_second_place_expert_prob))
+  _, top_expert_index = mtf.top_1(gate_logits, reduced_dim=experts_dim)
+  top_expert_mask = mtf.one_hot(
+      top_expert_index, experts_dim, dtype=gate_logits.dtype)
+
+  # With probability moe_expert_use_second_place_expert_prob send the token to
+  # the non-top expert.
+  use_second_place_expert = mtf.cast(
+      mtf.less(
+          mtf.random_uniform(gate_logits.mesh, gate_logits.shape[:-1]),
+          hparams.moe_use_second_place_expert_prob), gate_logits.dtype)
+  # Mask out the top logit.
+  second_place_gate_logits = -1e9 * top_expert_mask + gate_logits
+
+  # If a temperature is specified sample from the remaining N-1 experts.
+  if hparams.moe_use_second_place_expert_prob_temp is not None:
+    tf.logging.info("Expert second place temp: {}".format(
+        hparams.moe_use_second_place_expert_prob_temp))
+    # What expert should be used.
+    second_expert_index = mtf.sample_with_temperature(
+        second_place_gate_logits, experts_dim,
+        temperature=hparams.moe_use_second_place_expert_prob_temp)
+    second_expert_mask = mtf.one_hot(
+        second_expert_index, experts_dim, dtype=gate_logits.dtype)
+    # Set all logits to -inf that are not the sampled expert
+    second_place_gate_logits += (1 - second_expert_mask) * -1e9
+  gate_logits = (use_second_place_expert * second_place_gate_logits +
+                 (1 - use_second_place_expert) * gate_logits)
+  return gate_logits
+
+
+def _ntlb_gating(inputs,
+                 outer_expert_dims,
+                 experts_dim,
+                 expert_capacity_dim,
+                 hparams,
+                 train,
+                 variable_dtype,
+                 importance=None,
+                 name="ntlb_gating",
+                 num_microbatches=None,
+                 token_embeddings=None):
+  """Compute Switch gating with no-token-left behind (NTLB) behavior."""
   # SELECT EXPERT
   if train:
-    policy = hparams.moe_rand_1_policy_train
+    policy = hparams.moe_switch_policy_train
   else:
-    policy = hparams.moe_rand_1_policy_eval
+    policy = hparams.moe_switch_policy_eval
+
+  # The internals of this function run in float32.
+  # bfloat16 seems to reduce quality.
+  gate_inputs = mtf.to_float(inputs)
 
   # Input perturbations
   if train and policy == "input_jitter":
-    inputs = mtf.layers.multiplicative_jitter(inputs, hparams.moe_rand_1_jitter)
+    gate_inputs = mtf.layers.multiplicative_jitter(
+        gate_inputs, hparams.moe_switch_jitter)
+
+  if hparams.moe_word_embed_mode is not None:
+    gate_inputs = _add_token_emb_to_gate_inputs(
+        gate_inputs, token_embeddings, hparams.moe_word_embed_mode)
 
   gate_logits = mtf.layers.dense(
-      inputs,
+      gate_inputs,
       experts_dim,
       use_bias=False,
       expert_dims=outer_expert_dims,
       variable_dtype=variable_dtype,
       name=name)
+
+  if hparams.moe_use_second_place_expert_prob is not None and train:
+    gate_logits = _stochastically_use_non_top_expert(
+        gate_logits, experts_dim, hparams)
+
   raw_gates = mtf.softmax(gate_logits, reduced_dim=experts_dim)
 
   # The internals of this function run in float32.
@@ -809,7 +927,7 @@ def _switch_gating(inputs,
   raw_gates = mtf.to_float(raw_gates)
 
   # Top-k operation
-  k_dim = mtf.Dimension("k", hparams.moe_switch_top_k)
+  k_dim = mtf.Dimension("k", hparams.moe_ntlb_top_k)
   expert_gate, expert_index = mtf.top_k(
       raw_gates, reduced_dim=experts_dim, k_dim=k_dim)
   expert_mask = mtf.one_hot(expert_index, experts_dim)
@@ -832,6 +950,14 @@ def _switch_gating(inputs,
     tf.logging.info("Dividing load-balance loss by num_microbatches={}".format(
         num_microbatches))
     loss /= num_microbatches
+
+  # Add in the z_loss for router.
+  if train and hparams.moe_z_loss is not None:
+    tf.logging.info("Using z_loss: {}".format(hparams.moe_z_loss))
+    z_loss = _router_z_loss(gate_logits, experts_dim, num_microbatches,
+                            importance)
+    mtf.scalar_summary(name + "/z_loss", z_loss)
+    loss += (hparams.moe_z_loss * z_loss)
 
   # Logging
   if train:
@@ -913,27 +1039,35 @@ def _switch_gating(inputs,
   return dispatch_tensor, combine_tensor, loss
 
 
-def _rand_1_gating(
+def _switch_max_gating(
     inputs, outer_expert_dims, experts_dim, expert_capacity_dim,
-    hparams, train, variable_dtype, importance=None, name="rand_1_gating",
-    num_microbatches=None):
-  """Compute a random top-1 gating."""
+    hparams, train, variable_dtype, importance=None, name="switch_max_gating",
+    num_microbatches=None, token_embeddings=None):
+  """Compute Switch gating."""
+  # TODO(barretzoph,liamfedus): Refactor switch_max, switch and ntlb to limit
+  # code resuse.
   # SELECT EXPERT
   if train:
-    policy = hparams.moe_rand_1_policy_train
+    policy = hparams.moe_switch_policy_train
   else:
-    policy = hparams.moe_rand_1_policy_eval
+    policy = hparams.moe_switch_policy_eval
 
   # The internals of this function run in float32.
   #   bfloat16 seems to reduce quality.
   gate_inputs = mtf.to_float(inputs)
 
   # Input perturbations
-  if train and policy == "input_dropout":
-    gate_inputs = mtf.dropout(gate_inputs, 1.0 - hparams.moe_rand_1_dropout)
+  if policy == "input_dropout":
+    gate_inputs = mtf.dropout(
+        gate_inputs, is_training=train,
+        keep_prob=1.0 - hparams.moe_switch_dropout)
   elif train and policy == "input_jitter":
     gate_inputs = mtf.layers.multiplicative_jitter(gate_inputs,
-                                                   hparams.moe_rand_1_jitter)
+                                                   hparams.moe_switch_jitter)
+
+  if hparams.moe_word_embed_mode is not None:
+    gate_inputs = _add_token_emb_to_gate_inputs(
+        gate_inputs, token_embeddings, hparams.moe_word_embed_mode)
 
   gate_logits = mtf.layers.dense(
       gate_inputs,
@@ -942,23 +1076,285 @@ def _rand_1_gating(
       expert_dims=outer_expert_dims,
       variable_dtype=variable_dtype,
       name=name)
+
+  if hparams.moe_use_second_place_expert_prob is not None and train:
+    gate_logits = _stochastically_use_non_top_expert(
+        gate_logits, experts_dim, hparams)
+
   raw_gates = mtf.softmax(gate_logits, reduced_dim=experts_dim)
 
   if policy == "argmax" or policy == "input_dropout" or policy == "input_jitter":
     expert_gate, expert_index = mtf.top_1(raw_gates, reduced_dim=experts_dim)
-    if train:
-      mtf.scalar_summary("expert_gate", mtf.reduce_mean(expert_gate))
   elif policy == "sample":
     expert_index = mtf.sample_with_temperature(
-        gate_logits, experts_dim, temperature=hparams.moe_rand_1_temperature)
+        gate_logits, experts_dim, temperature=hparams.moe_switch_temperature)
     expert_gate = mtf.gather(raw_gates, expert_index, dim=experts_dim)
   else:
-    raise ValueError("Unknown rand_1 policy %s" % policy)
+    raise ValueError("Unknown Switch gating policy %s" % policy)
 
   expert_mask = mtf.one_hot(expert_index, experts_dim, dtype=raw_gates.dtype)
 
   # LOAD BALANCING LOSS
-  # TODO(liamfedus): Check entropy loss.
+  group_size_dim = inputs.shape[-2]
+  density_1 = mtf.reduce_mean(expert_mask, reduced_dim=group_size_dim)
+  density_1_proxy = mtf.reduce_mean(raw_gates, reduced_dim=group_size_dim)
+  if importance is not None:
+    expert_mask *= mtf.cast(mtf.equal(importance, 1.0), dtype=raw_gates.dtype)
+    expert_gate *= mtf.cast(mtf.equal(importance, 1.0), dtype=raw_gates.dtype)
+    density_1_proxy *= mtf.cast(
+        mtf.equal(importance, 1.0), dtype=raw_gates.dtype)
+  loss = (
+      mtf.reduce_mean(density_1_proxy * density_1) *
+      float(experts_dim.size * experts_dim.size))
+  if num_microbatches and num_microbatches > 1:
+    tf.logging.info("Dividing load-balance loss by num_microbatches={}".format(
+        num_microbatches))
+    loss /= num_microbatches
+
+  # Add in the z_loss for router.
+  if train and hparams.moe_z_loss is not None:
+    tf.logging.info("Using z_loss: {}".format(hparams.moe_z_loss))
+    z_loss = _router_z_loss(gate_logits, experts_dim, num_microbatches,
+                            importance)
+    mtf.scalar_summary(name + "/z_loss", z_loss)
+    loss += (hparams.moe_z_loss * z_loss)
+
+  # Logging
+  if train:
+    entropy = mtf.reduce_sum(-raw_gates * mtf.log(raw_gates + 1e-9),
+                             reduced_dim=experts_dim)
+    batch_entropy = mtf.reduce_mean(entropy)
+    mtf.scalar_summary(name + "/entropy", batch_entropy)
+    mtf.scalar_summary("expert_gate", mtf.reduce_mean(expert_gate))
+
+    mask_count_experts = mtf.reduce_sum(expert_mask, output_shape=[experts_dim])
+    total_routed = mtf.reduce_sum(mask_count_experts)
+    expert_fraction = mtf.to_float(mask_count_experts / total_routed)
+    split_fractions = mtf.split(
+        expert_fraction,
+        split_dim=experts_dim,
+        num_or_size_splits=experts_dim.size)
+    for fraction in split_fractions:
+      mtf.scalar_summary("experts/" + fraction.name.replace(":", "/"),
+                         mtf.reduce_mean(fraction))
+    mtf.scalar_summary("aux_loss", mtf.reduce_mean(loss))
+
+  # Instead of doing the normal cumulative sum we want to take the top
+  # `expert_capacity` tokens. If there are less than `expert_capacity_dim`
+  # tokens getting routed to an expert then the combine_tensor will zero these
+  # out
+  # expert_mask shape: [outer_batch, batch, group_size, experts_unsplit]
+  # expert_gate shape: [outer_batch, batch, group_size]
+  expert_masked_probs = expert_mask * expert_gate
+  expert_gate_probs, expert_gate_indices = mtf.top_k(
+      expert_masked_probs, reduced_dim=group_size_dim,
+      k_dim=expert_capacity_dim)
+  dispatch_tensor = mtf.one_hot(
+      expert_gate_indices, group_size_dim, dtype=raw_gates.dtype)
+  combine_tensor = dispatch_tensor * expert_gate_probs
+
+  if train:
+    total_routed = mtf.reduce_sum(mtf.cast(mtf.greater(combine_tensor, 0.0),
+                                           dtype=raw_gates.dtype))
+    importance = mtf.cast(importance, dtype=total_routed.dtype)
+    mtf.scalar_summary("fraction_routed",
+                       total_routed / mtf.reduce_sum(importance))
+
+  # Match the inputs dtype.
+  combine_tensor = mtf.cast(combine_tensor, inputs.dtype)
+  loss = mtf.cast(loss, inputs.dtype)
+  dispatch_tensor = mtf.cast(
+      mtf.cast(combine_tensor, tf.bool), combine_tensor.dtype)
+
+  return dispatch_tensor, combine_tensor, loss
+
+
+def _expert_selection_gating(
+    inputs, outer_expert_dims, experts_dim, group_size_dim,
+    expert_capacity_dim, hparams, train, variable_dtype, importance=None,
+    name="expert_selection_gating", num_microbatches=None,
+    normalize_by_num_experts_routed=True, token_embeddings=None):
+  """Compute gating where each expert chooses what tokens it wants."""
+  # Select the randomization policy.
+  if train:
+    policy = hparams.moe_switch_policy_train
+  else:
+    policy = hparams.moe_switch_policy_eval
+
+  # The internals of this function run in float32 otherwise instabilities
+  # can occur.
+  gate_inputs = mtf.to_float(inputs)
+
+  # Input perturbations for exploration.
+  if policy == "input_dropout":
+    gate_inputs = mtf.dropout(gate_inputs, is_training=train,
+                              keep_prob=1.0 - hparams.moe_switch_dropout)
+  elif train and policy == "input_jitter":
+    gate_inputs = mtf.layers.multiplicative_jitter(gate_inputs,
+                                                   hparams.moe_switch_jitter)
+
+  if hparams.moe_word_embed_mode is not None:
+    gate_inputs = _add_token_emb_to_gate_inputs(
+        gate_inputs, token_embeddings, hparams.moe_word_embed_mode)
+
+  # Compute expert logits for each token.
+  # gate_logits shape: [outer_batch, batch, group, expert_unsplit]
+  gate_logits = mtf.layers.dense(
+      gate_inputs,
+      experts_dim,
+      use_bias=False,
+      expert_dims=outer_expert_dims,
+      variable_dtype=variable_dtype,
+      name=name)
+
+  # Set tokens to -inf before softmax if importance is zero as softmax is
+  # normalized over all tokens in the group.
+  if importance is not None:
+    gate_logits += mtf.cast(
+        mtf.equal(importance, 0.0), dtype=gate_logits.dtype) * -1e9
+  raw_gates = mtf.softmax(gate_logits, reduced_dim=group_size_dim)
+
+  # expert_gate_probs shape:
+  # [outer_batch, batch, expert_unsplit, expert_capacity]
+  # expert_gate_indices shape:
+  # [outer_batch, batch, expert_unsplit, expert_capacity]
+  expert_gate_probs, expert_gate_indices = mtf.top_k(
+      raw_gates, reduced_dim=group_size_dim, k_dim=expert_capacity_dim)
+
+  # dispatch_tensor shape:
+  # [outer_batch, batch, expert_unsplit, expert_capacity, group]
+  dispatch_tensor = mtf.one_hot(
+      expert_gate_indices, group_size_dim, dtype=raw_gates.dtype)
+
+  # combine_tensor shape:
+  # [outer_batch, batch, expert_unsplit, expert_capacity, group]
+  combine_tensor = dispatch_tensor * expert_gate_probs
+
+  # Tokens will be aggregated across many experts and will not
+  # be normalized. This could be an issue, so might want to normalize by the
+  # number of experts each token is sent to.
+  if normalize_by_num_experts_routed:
+    num_experts_routed = mtf.reduce_sum(
+        dispatch_tensor,
+        output_shape=(dispatch_tensor.shape[:2] + [group_size_dim]))
+    combine_tensor /= mtf.maximum(num_experts_routed, 1.0)
+
+  ################### Compute the load balancing loss ###################
+  # Push `aggregated_group_probs` of size `group` (which sums to num_experts)
+  # to be uniform.
+  # aggregated_group_probs shape: [outer_batch, batch, group]
+  # importance shape: [outer_batch, batch, group]
+  aggregated_group_probs = mtf.reduce_mean(raw_gates, reduced_dim=experts_dim)
+  if importance is not None:
+    aggregated_group_probs *= mtf.cast(
+        mtf.equal(importance, 1.0), dtype=raw_gates.dtype)
+
+  # Scale loss by group_size to keep loss constant across different group_sizes.
+  # true_group_size is number of tokens per group that are not masked out.
+  true_group_size = mtf.cast(
+      mtf.reduce_sum(importance, reduced_dim=group_size_dim),
+      dtype=raw_gates.dtype)
+  loss = (mtf.reduce_mean(
+      aggregated_group_probs * aggregated_group_probs * true_group_size) *
+          float(group_size_dim.size))
+
+  if num_microbatches and num_microbatches > 1:
+    tf.logging.info("Dividing load-balance loss by num_microbatches={}".format(
+        num_microbatches))
+    loss /= num_microbatches
+
+  # Add in the z_loss for router.
+  if train and hparams.moe_z_loss is not None:
+    tf.logging.info("Using z_loss: {}".format(hparams.moe_z_loss))
+    z_loss = _router_z_loss(gate_logits, experts_dim, num_microbatches,
+                            importance)
+    mtf.scalar_summary(name + "/z_loss", z_loss)
+    loss += (hparams.moe_z_loss * z_loss)
+
+  ################### Logging ###################
+  if train:
+    entropy = mtf.reduce_sum(-raw_gates * mtf.log(raw_gates + 1e-9),
+                             reduced_dim=group_size_dim)
+    batch_entropy = mtf.reduce_mean(entropy)
+    mtf.scalar_summary(name + "/entropy", batch_entropy)
+
+    # Log for each token in the group how many experts it gets sent to.
+    num_experts_sent_per_token = (
+        mtf.reduce_sum(dispatch_tensor, output_shape=[group_size_dim]) *
+        float(experts_dim.size * expert_capacity_dim.size))
+    split_fractions = mtf.split(
+        num_experts_sent_per_token,
+        split_dim=group_size_dim,
+        num_or_size_splits=group_size_dim.size)
+    for fraction in split_fractions:
+      mtf.scalar_summary("group_token/" + fraction.name.replace(":", "/"),
+                         mtf.reduce_sum(fraction))
+    mtf.scalar_summary("aux_loss", mtf.reduce_mean(loss))
+
+  #################### Match the inputs dtype ###################
+  combine_tensor = mtf.cast(combine_tensor, inputs.dtype)
+  loss = mtf.cast(loss, inputs.dtype)
+  dispatch_tensor = mtf.cast(
+      mtf.cast(dispatch_tensor, tf.bool), combine_tensor.dtype)
+
+  return dispatch_tensor, combine_tensor, loss
+
+
+def _switch_gating(
+    inputs, outer_expert_dims, experts_dim, expert_capacity_dim,
+    hparams, train, variable_dtype, importance=None, name="switch_gating",
+    num_microbatches=None, token_embeddings=None):
+  """Compute Switch gating."""
+  # SELECT EXPERT
+  if train:
+    policy = hparams.moe_switch_policy_train
+  else:
+    policy = hparams.moe_switch_policy_eval
+
+  # The internals of this function run in float32.
+  #   bfloat16 seems to reduce quality.
+  gate_inputs = mtf.to_float(inputs)
+
+  # Input perturbations
+  if policy == "input_dropout":
+    gate_inputs = mtf.dropout(
+        gate_inputs,
+        is_training=train,
+        keep_prob=1.0 - hparams.moe_switch_dropout)
+  elif train and policy == "input_jitter":
+    gate_inputs = mtf.layers.multiplicative_jitter(gate_inputs,
+                                                   hparams.moe_switch_jitter)
+
+  if hparams.moe_word_embed_mode is not None:
+    gate_inputs = _add_token_emb_to_gate_inputs(
+        gate_inputs, token_embeddings, hparams.moe_word_embed_mode)
+
+  gate_logits = mtf.layers.dense(
+      gate_inputs,
+      experts_dim,
+      use_bias=False,
+      expert_dims=outer_expert_dims,
+      variable_dtype=variable_dtype,
+      name=name)
+
+  if hparams.moe_use_second_place_expert_prob is not None and train:
+    gate_logits = _stochastically_use_non_top_expert(
+        gate_logits, experts_dim, hparams)
+
+  raw_gates = mtf.softmax(gate_logits, reduced_dim=experts_dim)
+
+  if policy == "argmax" or policy == "input_dropout" or policy == "input_jitter":
+    expert_gate, expert_index = mtf.top_1(raw_gates, reduced_dim=experts_dim)
+  elif policy == "sample":
+    expert_index = mtf.sample_with_temperature(
+        gate_logits, experts_dim, temperature=hparams.moe_switch_temperature)
+    expert_gate = mtf.gather(raw_gates, expert_index, dim=experts_dim)
+  else:
+    raise ValueError("Unknown Switch gating policy %s" % policy)
+
+  expert_mask = mtf.one_hot(expert_index, experts_dim, dtype=raw_gates.dtype)
+
+  # LOAD BALANCING LOSS
   group_size_dim = inputs.shape[-2]
   density_1 = mtf.reduce_mean(expert_mask, reduced_dim=group_size_dim)
   density_1_proxy = mtf.reduce_mean(raw_gates, reduced_dim=group_size_dim)
@@ -981,6 +1377,7 @@ def _rand_1_gating(
                              reduced_dim=experts_dim)
     batch_entropy = mtf.reduce_mean(entropy)
     mtf.scalar_summary(name + "/entropy", batch_entropy)
+    mtf.scalar_summary("expert_gate", mtf.reduce_mean(expert_gate))
 
     mask_count_experts = mtf.reduce_sum(expert_mask, output_shape=[experts_dim])
     total_routed = mtf.reduce_sum(mask_count_experts)
@@ -993,6 +1390,14 @@ def _rand_1_gating(
       mtf.scalar_summary("experts/" + fraction.name.replace(":", "/"),
                          mtf.reduce_mean(fraction))
     mtf.scalar_summary("aux_loss", mtf.reduce_mean(loss))
+
+  # Add in the z_loss for router.
+  if train and hparams.moe_z_loss is not None:
+    tf.logging.info("Using z_loss: {}".format(hparams.moe_z_loss))
+    z_loss = _router_z_loss(gate_logits, experts_dim, num_microbatches,
+                            importance)
+    mtf.scalar_summary(name + "/z_loss", z_loss)
+    loss += (hparams.moe_z_loss * z_loss)
 
   # COMPUTE ASSIGNMENT TO EXPERT
   # Experts have a limited capacity, ensure we do not exceed it. Construct
@@ -1037,7 +1442,7 @@ def _rand_1_gating(
 def _top_2_gating(
     inputs, outer_expert_dims, experts_dim, expert_capacity_dim,
     hparams, train, variable_dtype, importance=None, name="top_2_gating",
-    num_microbatches=None):
+    num_microbatches=None, token_embeddings=None):
   """Compute gating for mixture-of-experts in TensorFlow.
 
   Note: until the algorithm and inferface solidify, we pass in a hyperparameters
@@ -1091,6 +1496,9 @@ def _top_2_gating(
     importance: an optional tensor with shape [<batch_dims>, group_size_dim]
     name: an optional string
     num_microbatches: number of microbatches.
+    token_embeddings: an optional tensor with shape
+      [<batch_dims>, group_size_dim, input_dim] that is the input
+      word embeddings.
 
   Returns:
     dispatch_tensor: a Tensor with shape
@@ -1108,12 +1516,16 @@ def _top_2_gating(
   # bfloat16 seems to reduce quality.
   gate_inputs = mtf.to_float(inputs)
 
-  raw_gates = mtf.layers.dense(
+  if hparams.moe_word_embed_mode is not None:
+    gate_inputs = _add_token_emb_to_gate_inputs(
+        gate_inputs, token_embeddings, hparams.moe_word_embed_mode)
+
+  gate_logits = mtf.layers.dense(
       gate_inputs, experts_dim, use_bias=False,
       expert_dims=outer_expert_dims,
       variable_dtype=variable_dtype,
       name=name)
-  raw_gates = mtf.softmax(raw_gates, experts_dim)
+  raw_gates = mtf.softmax(gate_logits, experts_dim)
 
   expert_capacity_f = float(expert_capacity_dim.size)
 
@@ -1165,6 +1577,14 @@ def _top_2_gating(
     tf.logging.info("Dividing load-balance loss by num_microbatches={}".format(
         num_microbatches))
     loss /= num_microbatches
+
+  # Add in the z_loss for router.
+  if train and hparams.moe_z_loss is not None:
+    tf.logging.info("Using z_loss: {}".format(hparams.moe_z_loss))
+    z_loss = _router_z_loss(gate_logits, experts_dim, num_microbatches,
+                            importance)
+    mtf.scalar_summary(name + "/z_loss", z_loss)
+    loss += (hparams.moe_z_loss * z_loss)
 
   # Depending on the policy in the hparams, we may drop out some of the
   # second-place experts.
@@ -1220,6 +1640,55 @@ def _top_2_gating(
   position_in_expert_2 = mtf.reduce_sum(
       position_in_expert_2, reduced_dim=experts_dim)
 
+  if train:
+    # Gate entropy.
+    if importance is not None:
+      raw_gates *= mtf.to_float(mtf.greater(importance, 0.0))
+    entropy = mtf.reduce_sum(-raw_gates * mtf.log(raw_gates + 1e-9),
+                             reduced_dim=experts_dim)
+    batch_entropy = mtf.reduce_mean(entropy)
+    mtf.scalar_summary(name + "/entropy", batch_entropy)
+
+    # Mean top-1 and top-2 normalized gate probabilities.
+    if importance is not None:
+      gate_2 *= mtf.to_float(mtf.greater(importance, 0.0))
+    mtf.scalar_summary("top1_gate_normalized", mtf.reduce_mean(gate_1))
+    mtf.scalar_summary("top2_gate_normalized", mtf.reduce_mean(gate_2))
+    top1_routed = mtf.reduce_sum(mask_1_flat)
+    top2_routed = mtf.reduce_sum(mask_2_flat)
+    importance = mtf.cast(importance, dtype=top1_routed.dtype)
+
+    # What fraction of the top-1 and top-2 tokens are being routed to any
+    # expert.
+    mtf.scalar_summary("top1_fraction_routed",
+                       top1_routed / mtf.reduce_sum(importance))
+    mtf.scalar_summary("top2_fraction_routed",
+                       top2_routed / mtf.reduce_sum(importance))
+    # One or zero if that token got routed anywhere.
+    total_routed = mtf.reduce_sum(mtf.minimum(
+        mask_1_flat + mask_2_flat, mtf.ones_like(top1_routed)))
+    mtf.scalar_summary("all_fraction_routed",
+                       total_routed / mtf.reduce_sum(importance))
+    mtf.scalar_summary("aux_loss", mtf.reduce_mean(loss))
+
+    # Log what fraction of tokens are going to each expert.
+    def _log_per_expert_fraction(mask, name):
+      # mask: [batch, group, experts]
+      tokens_per_expert = mtf.reduce_sum(mask, output_shape=[experts_dim])
+      total_routed = mtf.reduce_sum(tokens_per_expert)
+      expert_fraction = mtf.to_float(tokens_per_expert / total_routed)
+      split_fractions = mtf.split(
+          expert_fraction,
+          split_dim=experts_dim,
+          num_or_size_splits=experts_dim.size)
+      for fraction in split_fractions:
+        mtf.scalar_summary(name + "_experts/" + fraction.name.replace(":", "/"),
+                           mtf.reduce_mean(fraction))
+
+    _log_per_expert_fraction(mask_1, "top1")
+    _log_per_expert_fraction(mask_2, "top2")
+    _log_per_expert_fraction(mask_1 + mask_2, "all")
+
   # [batch, group, experts, expert_capacity]
   combine_tensor = (
       gate_1 * mask_1_flat
@@ -1236,6 +1705,275 @@ def _top_2_gating(
       mtf.cast(combine_tensor, tf.bool), combine_tensor.dtype)
 
   return dispatch_tensor, combine_tensor, loss
+
+
+def _top_n_gating(
+    inputs, outer_expert_dims, experts_dim, expert_capacity_dim,
+    hparams, train, variable_dtype, importance=None, name="top_n_gating",
+    num_microbatches=None, token_embeddings=None):
+  """Compute generalization of top-2 gating for mixture-of-experts.
+
+  Hyperparameters used:
+    hparams.moe_use_second_place_loss: a boolean
+    hparams.moe_second_policy_train: a string
+    hparams.moe_second_policy_eval: a string
+    hparams.moe_second_threshold: a float
+    hparams.moe_top_n_num_experts_per_token: an int
+
+  Tensor shapes are largely the same as in top_2 gating, so see that docstring
+  for more details.
+
+  Args:
+    inputs: a mtf.Tensor with shape [<batch_dims>, group_size_dim, input_dim]
+    outer_expert_dims: an optional list of dimensions.  This is for the case
+      where we are at an inner level of a hierarchical MoE.
+    experts_dim: a Dimension (the number of experts)
+    expert_capacity_dim: a Dimension (number of examples per group per expert)
+    hparams: model hyperparameters.
+    train: a boolean
+    variable_dtype: a mtf.VariableDType
+    importance: an optional tensor with shape [<batch_dims>, group_size_dim]
+    name: an optional string
+    num_microbatches: number of microbatches.
+    token_embeddings: an optional tensor with shape
+      [<batch_dims>, group_size_dim, input_dim] that is the input
+      word embeddings.
+
+  Returns:
+    dispatch_tensor: a Tensor with shape
+      [<batch_dims>, group_size_dim, experts_dim, expert_capacity_dim]
+    combine_tensor: a Tensor with shape
+      [<batch_dims>, group_size_dim, experts_dim, expert_capacity_dim]
+    loss: a mtf scalar
+
+  Raises:
+    ValueError: on illegal hyperparameters
+  """
+
+  group_size_dim, unused_input_dim = inputs.shape.dims[-2:]
+
+  # The internals of this function run in float32.
+  # bfloat16 seems to reduce quality.
+  gate_inputs = mtf.to_float(inputs)
+
+  if hparams.moe_word_embed_mode is not None:
+    gate_inputs = _add_token_emb_to_gate_inputs(
+        gate_inputs, token_embeddings, hparams.moe_word_embed_mode)
+
+  gate_logits = mtf.layers.dense(
+      gate_inputs, experts_dim, use_bias=False,
+      expert_dims=outer_expert_dims,
+      variable_dtype=variable_dtype,
+      name=name)
+  raw_gates = mtf.softmax(gate_logits, experts_dim)
+
+  expert_capacity_f = float(expert_capacity_dim.size)
+
+  # Used for aux loss.
+  density_1_proxy = raw_gates
+  if importance is not None:
+    density_1_proxy *= mtf.to_float(mtf.equal(importance, 1.0))
+
+  # Loop over the get the top-n tokens and their masks.
+  gates = []
+  masks = []
+  indexes = []
+  # Tensor that contains all but the top-n highest experts for each token.
+  gates_without_top_n = raw_gates
+  gates_without_top_1 = None  # Used for second place loss
+  for n in range(hparams.moe_top_n_num_experts_per_token):
+    # [batch, group]
+    gate_n, index_n = mtf.top_1(gates_without_top_n, experts_dim)
+    # [batch, group, experts]
+    mask_n = mtf.one_hot(index_n, experts_dim, dtype=raw_gates.dtype)
+    if importance is not None:
+      mask_n *= mtf.to_float(mtf.greater(importance, 0.0))
+      gate_n *= mtf.to_float(mtf.greater(importance, 0.0))
+    gates_without_top_n *= (1.0 - mask_n)
+    # Used for second place loss.
+    if n == 1:
+      gates_without_top_1 = gates_without_top_n
+    gates.append(gate_n)
+    masks.append(mask_n)
+    indexes.append(index_n)
+
+  if len(gates) > 1:
+    # All gates probs are normalized over the top-n tokens.
+    denom = mtf.add_n(gates) + 1e-9
+    gates = [gate / denom for gate in gates]
+
+  # BALANCING LOSSES
+  # shape = [batch, experts]
+  # We want to equalize the fraction of the batch assigned to each expert.
+  mask_1 = masks[0]  # Mask for top-1 token.
+  density_1 = mtf.reduce_mean(mask_1, reduced_dim=group_size_dim)
+  # Something continuous that is correlated with what we want to equalize.
+  density_1_proxy = mtf.reduce_mean(density_1_proxy, reduced_dim=group_size_dim)
+  loss = (mtf.reduce_mean(density_1_proxy * density_1)
+          * float(experts_dim.size * experts_dim.size))
+  # TODO(barretzoph): Add in options for aux losses for n > 2.
+  if hparams.moe_use_second_place_loss:
+    pass
+    # Also add a loss to encourage all experts to be used equally also as the
+    # second-place expert.  Experimentally, this seems to be a wash.
+    # We want to equalize the fraction of the batch assigned to each expert:
+    density_2 = mtf.reduce_mean(masks[2], reduced_dim=group_size_dim)
+    # As a proxy for density_2, we renormalize the raw gates after the top one
+    # has been removed.
+    normalized = gates_without_top_1 / (
+        mtf.reduce_sum(gates_without_top_1, reduced_dim=experts_dim) + 1e-9)
+    density_2_proxy = mtf.reduce_mean(normalized, reduced_dim=group_size_dim)
+    loss_2 = (mtf.reduce_mean(density_2_proxy * density_2)
+              * float(experts_dim.size * experts_dim.size))
+    loss += loss_2 * 0.5
+  if num_microbatches and num_microbatches > 1:
+    tf.logging.info("Dividing load-balance loss by num_microbatches={}".format(
+        num_microbatches))
+    loss /= num_microbatches
+
+  # Add in the z_loss for router.
+  if train and hparams.moe_z_loss is not None:
+    tf.logging.info("Using z_loss: {}".format(hparams.moe_z_loss))
+    z_loss = _router_z_loss(gate_logits, experts_dim, num_microbatches,
+                            importance)
+    mtf.scalar_summary(name + "/z_loss", z_loss)
+    loss += (hparams.moe_z_loss * z_loss)
+
+  # Depending on the policy in the hparams, we may drop out some of the
+  # second-place experts.
+  def _update_mask_based_on_gate_value(gate_n, mask_n):
+    """Update the mask based in the policy and the threshold for n>1.
+
+    Args:
+      gate_n: normalized router probability for the nth highest expert.
+      mask_n: boolean one-hot tensor that keeps track of the nth expert to
+        send to each toke. This also masks away tokens that will not be routed.
+
+    Returns:
+      An altered mask_n that will mask out any top-n token that doesn't follow
+      the second_policy method and threshold.
+    """
+    if train:
+      policy = hparams.moe_second_policy_train
+      threshold = hparams.moe_second_threshold_train
+    else:
+      policy = hparams.moe_second_policy_eval
+      threshold = hparams.moe_second_threshold_eval
+    if policy == "all":
+      # Use nth-place experts for all examples.
+      pass
+    elif policy == "none":
+      # Never use nth-place experts for all examples.
+      mask_n = mtf.zeros_like(mask_n)
+    elif policy == "threshold":
+      # Use nth-place experts if gate_n > threshold.
+      mask_n *= mtf.to_float(mtf.greater(gate_n, threshold))
+    elif policy == "random":
+      # Use nth-place experts with probablity min(1.0, gate_n / threshold).
+      mask_n *= mtf.to_float(
+          mtf.less(mtf.random_uniform(gate_n.mesh, gate_n.shape),
+                   gate_n / max(threshold, 1e-9)))
+    else:
+      raise ValueError("Unknown policy %s" % policy)
+    return mask_n
+
+  # Now update masks for n>1 to reflect how these additional tokens should be
+  # routed according to their corresponding policies.
+  # Only update for n>1 as we always want to route the top-1 token.
+  for i in range(1, len(masks)):
+    masks[i] = _update_mask_based_on_gate_value(gates[i], masks[i])
+
+  def _compute_top_n_mask(gate_n, mask_n, index_n, prev_mask_count):
+    # This is the position within the expert's mini-batch for this sequence.
+    position_in_expert_n = (
+        mtf.cumsum(mask_n, group_size_dim, exclusive=True) + prev_mask_count)
+    # Mask out tokens that should not be routed.
+    position_in_expert_n *= mask_n
+    # Remove the elements that don't fit. [batch, group, experts]
+    mask_n *= mtf.to_float(mtf.less(position_in_expert_n, expert_capacity_f))
+    # [batch, experts]
+    # How many examples in this sequence go to this expert.
+    mask_n_count = mtf.reduce_sum(mask_n, reduced_dim=group_size_dim)
+    # Keep running sum of total tokens sent to each expert.
+    prev_mask_count += mask_n_count
+
+    # [batch, group] - mostly ones, but zeros where something didn't fit.
+    mask_n_flat = mtf.reduce_sum(mask_n, reduced_dim=experts_dim)
+    # Weight assigned to nth expert.  [batch, group]
+    gate_n *= mask_n_flat
+    # [batch, group]
+    position_in_expert_n = mtf.reduce_sum(
+        position_in_expert_n, reduced_dim=experts_dim)
+    partial_combine_tensor = (
+        gate_n * mask_n_flat
+        * mtf.one_hot(index_n, experts_dim)
+        * mtf.one_hot(mtf.to_int32(position_in_expert_n), expert_capacity_dim))
+    return prev_mask_count, partial_combine_tensor
+
+  # [batch, experts]
+  # How many examples in this group go to each expert. This starts at zero.
+  prev_mask_count = 0.0
+  partial_combine_tensors = []
+  for gate_n, mask_n, index_n in zip(gates, masks, indexes):
+    prev_mask_count, partial_combine_tensor = _compute_top_n_mask(
+        gate_n, mask_n, index_n, prev_mask_count)
+    partial_combine_tensors.append(partial_combine_tensor)
+  combine_tensor = mtf.add_n(partial_combine_tensors)
+
+  combine_tensor = mtf.cast(combine_tensor, inputs.dtype)
+  loss = mtf.cast(loss, inputs.dtype)
+
+  dispatch_tensor = mtf.cast(
+      mtf.cast(combine_tensor, tf.bool), combine_tensor.dtype)
+
+  return dispatch_tensor, combine_tensor, loss
+
+
+def _add_token_emb_to_gate_inputs(
+    gate_inputs, token_embeddings, moe_word_embed_mode):
+  """Add token_embeddings to gate_inputs based on moe_word_embed_mode."""
+
+  token_embeddings = mtf.to_float(token_embeddings)
+  if moe_word_embed_mode == "concat":
+    gate_inputs = mtf.concat(
+        [gate_inputs, token_embeddings], gate_inputs.shape.dims[-1].name)
+  elif moe_word_embed_mode == "concat_stop_grad":
+    token_embeddings = mtf.stop_gradient(token_embeddings)
+    gate_inputs = mtf.concat(
+        [gate_inputs, token_embeddings], gate_inputs.shape.dims[-1].name)
+  elif moe_word_embed_mode == "add":
+    gate_inputs += token_embeddings
+  elif moe_word_embed_mode == "add_stop_grad":
+    gate_inputs += mtf.stop_gradient(token_embeddings)
+  elif moe_word_embed_mode == "embed_only":
+    gate_inputs = token_embeddings
+  else:
+    raise ValueError("Unimplemented moe word embed mode: {}".format(
+        moe_word_embed_mode))
+  return gate_inputs
+
+
+def _router_z_loss(logits, experts_dim, num_microbatches, importance=None):
+  """Loss that encourages router logits to remain small and improves stability.
+
+  Args:
+    logits: a tensor with shape [<batch_dims>, experts_dim]
+    experts_dim: a Dimension (the number of experts)
+    num_microbatches: number of microbatches
+    importance: an optional tensor with shape [<batch_dims>, group_size_dim]
+
+  Returns:
+    z_loss: scalar loss only applied by non-padded tokens and normalized by
+      num_microbatches.
+  """
+  log_z = mtf.reduce_logsumexp(logits, experts_dim)
+  z_loss = mtf.square(log_z)
+  if importance is not None:
+    z_loss *= mtf.cast(mtf.equal(importance, 1.0), dtype=z_loss.dtype)
+  denom = mtf.reduce_sum(
+      mtf.cast(mtf.equal(importance, 1.0), dtype=z_loss.dtype))
+  z_loss = mtf.reduce_sum(z_loss) / (denom * num_microbatches)
+  return z_loss
 
 
 def set_default_moe_hparams(hparams):

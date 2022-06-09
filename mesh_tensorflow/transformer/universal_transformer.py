@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The Mesh TensorFlow Authors.
+# Copyright 2022 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -601,6 +601,7 @@ class UTLayerStack(transformer.TransformerLayer):
       output = mtf.layers.dense_relu_dense(
           ffn_inputs,
           hidden_channels=context.model.model_dim,
+          is_training=context.train,
           dropout=self.relu_dropout
       )
 
@@ -698,7 +699,7 @@ class UTLayerStack(transformer.TransformerLayer):
   def _dropout(self, context, x):
     if context.train and self._dropout_rate > 0:
       return mtf.dropout(
-          x,
+          x, context.train,
           rate=self._dropout_rate,
           noise_shape=mtf.Shape(context.batch_dims + [context.model.model_dim]))
     else:

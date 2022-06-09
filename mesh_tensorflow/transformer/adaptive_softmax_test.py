@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The Mesh TensorFlow Authors.
+# Copyright 2022 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Lint as: python3
 """Tests for mesh_tensorflow.transformer.adaptive_softmax."""
 
 from __future__ import absolute_import
@@ -26,6 +25,7 @@ import mock
 import numpy as np
 import scipy.special
 import tensorflow.compat.v1 as tf
+from tensorflow.compat.v1 import estimator as tf_estimator
 
 
 def initialize_by_shape(shape_to_value):
@@ -349,7 +349,7 @@ class AdaptiveSoftmaxTest(tf.test.TestCase):
 
     context = mock.MagicMock()
     context.activation_dtype = tf.float32
-    context.mode = tf.estimator.ModeKeys.TRAIN
+    context.mode = tf_estimator.ModeKeys.TRAIN
 
     embeddings = tf.constant([[1, 0], [0, 2]], dtype=tf.float32)
     mtf_embeddings = mtf.import_tf_tensor(
@@ -387,7 +387,7 @@ class AdaptiveSoftmaxTest(tf.test.TestCase):
 
     context = mock.MagicMock()
     context.activation_dtype = tf.float32
-    context.mode = tf.estimator.ModeKeys.EVAL
+    context.mode = tf_estimator.ModeKeys.EVAL
 
     embeddings = tf.constant([[1, 0], [0, 2]], dtype=tf.float32)
     mtf_embeddings = mtf.import_tf_tensor(

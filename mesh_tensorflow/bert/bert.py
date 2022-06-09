@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The Mesh TensorFlow Authors.
+# Copyright 2022 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Lint as: python3
 """MeshTensorFlow implementation of BERT.
 
 The code is ported from https://github.com/google-research/bert.
@@ -239,7 +238,7 @@ class BertModel(object):
           self.embedding_output += short_position_table
         self.embedding_output = self.normalize(self.embedding_output)
         self.embedding_output = mtf.dropout(
-            self.embedding_output,
+            self.embedding_output, is_training,
             keep_prob=1.0 - self.config.layer_output_dropout_prob)
 
       with tf.variable_scope("encoder"):
@@ -283,7 +282,8 @@ class BertModel(object):
                 else:
                   raise ValueError("unknown layer type " + layer_type)
                 x = mtf.dropout(
-                    x, keep_prob=1.0 - self.config.layer_output_dropout_prob)
+                    x, is_training,
+                    keep_prob=1.0 - self.config.layer_output_dropout_prob)
                 layer_output = prev_layer_output + x
                 if self.config.residual_structure == "original":
                   layer_output = self.normalize(layer_output)
@@ -363,6 +363,7 @@ class BertModel(object):
     # seem a bit unusual, but is taken from the original Transformer paper.
     attention_probs = mtf.dropout(
         attention_probs,
+        is_training=(self.config.attention_probs_dropout_prob == 0.0),
         keep_prob=1.0 - self.config.attention_probs_dropout_prob)
 
     output = mtf.einsum([attention_probs, values],

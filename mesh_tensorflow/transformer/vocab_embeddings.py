@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The Mesh TensorFlow Authors.
+# Copyright 2022 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Lint as: python3
 """Different ways to go from token ids to hidden states and states to logits."""
 
 import gin
@@ -27,7 +26,7 @@ import tensorflow.compat.v1 as tf
 class FactorizedVocabEmbedding(object):
   """Factorizes the embedding matrix with projection to a small inner dimension.
 
-  Like ALBERT (https://arxiv.org/abs/1706.03762).
+  Like ALBERT (https://arxiv.org/abs/1909.11942).
 
   Interface matches mesh_tensorflow.transformer VocabEmbedding object.
   """
@@ -512,6 +511,7 @@ class Mixtape(object):
     if context.train and self._dropout_rate != 0.0:
       return mtf.dropout(
           tensor,
+          context.train,
           1.0 - self._dropout_rate,
           noise_shape=tensor.shape - context.length_dim)
     return tensor

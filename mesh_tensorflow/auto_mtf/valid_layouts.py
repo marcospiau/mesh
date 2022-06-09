@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The Mesh TensorFlow Authors.
+# Copyright 2022 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import fractions
+import math
 import re
 
 
@@ -132,7 +132,7 @@ class LayoutValidator(object):
     for mtf_operation in mtf_graph.operations:
       for mtf_tensor in mtf_operation.outputs:
         for mtf_dimension in mtf_tensor.shape.dims:
-          mtf_dimension_name_to_size_gcd[mtf_dimension.name] = fractions.gcd(
+          mtf_dimension_name_to_size_gcd[mtf_dimension.name] = math.gcd(
               mtf_dimension_name_to_size_gcd.get(mtf_dimension.name,
                                                  mtf_dimension.size),
               mtf_dimension.size)

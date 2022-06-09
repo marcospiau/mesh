@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The Mesh TensorFlow Authors.
+# Copyright 2022 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@ import six
 from six.moves import xrange  # pylint: disable=redefined-builtin
 
 import tensorflow.compat.v1 as tf
+from tensorflow.compat.v1 import estimator as tf_estimator
 
 # pylint: disable=g-direct-tensorflow-import
 from tensorflow.python.ops.gen_nn_ops import conv3d_backprop_input_v2
@@ -1919,6 +1920,11 @@ def _relu_grad(op, dy):
 
 def relu(x, name="relu"):
   return cwise(tf.nn.relu, [x], name=name, grad_function=_relu_grad)
+
+
+def squared_relu(x):
+  """Squared ReLU from Primer paper: https://arxiv.org/abs/2109.08668."""
+  return square(relu(x))
 
 
 def leaky_relu(x, alpha=0.2, name="leaky_relu"):
@@ -5447,6 +5453,49 @@ def processor_coordinates_to_pnum(mesh_shape, coord):
   return ret
 
 
+def pnum_to_processor_coordinates_nd(mesh_shape, pnum, device_assignment):
+  """Coordinates of a processor number in the mesh with a device assignment.
+
+  Args:
+    mesh_shape: a Shape or a list of integers
+    pnum: an integer less than len(mesh_shape)
+    device_assignment: accelerator device assignment
+
+  Returns:
+    a list of integers with length len(mesh_shape)
+  """
+  del mesh_shape
+  return device_assignment.coordinates(pnum, 0)
+
+
+def processor_coordinates_to_pnum_map_nd(mesh_shape, logical_to_physical,
+                                         device_assignment):
+  """Inverse map of pnum_to_processor_coordinates.
+
+  Args:
+    mesh_shape: a Shape or a list of integers
+    logical_to_physical: a list of coordinates with length len(mesh_shape)
+    device_assignment: accelerator device assignment
+
+  Returns:
+    A map of logical to physical pnums
+  """
+  coordinate_map = []
+  num_replicas = device_assignment.num_replicas
+  hw_mesh_shape = [int(i) for i in device_assignment.topology.mesh_shape]
+  for i in range(num_replicas):
+    coordinate_map.append(-1)
+  for i in range(num_replicas):
+    coord = device_assignment.coordinates(i, 0)
+    logical_id = coord[0] + coord[1] * hw_mesh_shape[0] + coord[
+        2] * hw_mesh_shape[0] * hw_mesh_shape[1]
+    coordinate_map[logical_id] = i
+  return [
+      coordinate_map[coord[0] + coord[1] * mesh_shape[0]]
+      for coord in logical_to_physical
+  ]
+
+
 def pnum_to_group(mesh_shape, group_dims, pnum):
   """Group number for grouped allreduce.
 
@@ -5737,7 +5786,7 @@ def pool_fn(pool_fn_string):
     raise ValueError("Unknown pool_fn_string %s" % pool_fn_string)
 
 
-class MtfCheckpointSaverListener(tf.estimator.CheckpointSaverListener):
+class MtfCheckpointSaverListener(tf_estimator.CheckpointSaverListener):
   """Copy slices to masters before saving."""
 
   def __init__(self, lowering):
@@ -5760,7 +5809,7 @@ class MtfCheckpointSaverListener(tf.estimator.CheckpointSaverListener):
     tf.logging.info("Done with the session.")
 
 
-class MtfRestoreHook(tf.estimator.SessionRunHook):
+class MtfRestoreHook(tf_estimator.SessionRunHook):
   """Copy masters to slices after restoring."""
 
   def __init__(self, lowering):
@@ -5829,7 +5878,8 @@ def random_normal(mesh, shape, **kwargs):
   return RandomOperation(mesh, shape, tf.random.normal, **kwargs).outputs[0]
 
 
-def dropout(x, keep_prob=None, rate=None, noise_shape=None, name=None):
+def dropout(x, is_training, keep_prob=None, rate=None, noise_shape=None,
+            name=None):
   """Randomly set some elements to 0 and scale up the rest.
 
   Dropout rate should be specified in exactly one of two ways:
@@ -5842,6 +5892,8 @@ def dropout(x, keep_prob=None, rate=None, noise_shape=None, name=None):
 
   Args:
     x: a Tensor
+    is_training: a boolean, set to true while training, if false dropout becomes
+      an identity function.
     keep_prob: a float between 0.0 and 1.0
     rate: a float between 0.0 and 1.0
     noise_shape: an optional Shape (a subset of x.shape)
@@ -5858,7 +5910,7 @@ def dropout(x, keep_prob=None, rate=None, noise_shape=None, name=None):
   if noise_shape is None:
     noise_shape = x.shape
   with tf.variable_scope(name, default_name="dropout"):
-    if keep_prob == 1.0:
+    if keep_prob == 1.0 or not is_training:
       return x
     noise = cast(less(random_uniform(
         x.mesh, noise_shape,
