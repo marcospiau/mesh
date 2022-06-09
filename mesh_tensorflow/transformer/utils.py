@@ -30,11 +30,8 @@ import math
 import os
 import random
 import re
-<<<<<<< HEAD
 import torch
-=======
 import time
->>>>>>> 6d440456e4d0d474b07546c8cf06eb83409b2bf1
 
 import gin
 import gin.tf
