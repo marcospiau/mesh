@@ -1362,12 +1362,12 @@ def decode(estimator,
     probs = torch.nn.functional.log_softmax(torch.from_numpy(np.array(scores)))
     score_string = probs.tolist()[1]
     output_string = f"{output_string}\t{score_string}"
-    decodes.append(output_string)
-    yield output_string
     if i & (i - 1) == 0:
       # LOG every power of 2.
       tf.logging.info("decoded %s: %s", i, input_string)
       tf.logging.info("            -> %s", output_string)
+    yield output_string
+
 
 
 @gin.configurable
