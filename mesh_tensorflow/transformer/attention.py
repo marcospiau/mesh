@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The Mesh TensorFlow Authors.
+# Copyright 2022 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -35,7 +35,8 @@ def attention(q,
               dropout_broadcast_dims=None,
               extra_logit=None,
               context=None,
-              float32_logits=True):
+              float32_logits=True,
+              z_loss_coeff=None):
   """Dot-product attention - doesn't use positional dimensions.
 
   key_dim is a Dimension representing the channels in the queries and keys
@@ -64,6 +65,9 @@ def attention(q,
     context: an optional Transformer.Context
     float32_logits: a boolean - if True, then compute logits in float32 to avoid
       numerical issues with bfloat16
+    z_loss_coeff: a float, if z_loss_coeff is not None then add an auxiliary
+      loss to push the attention logits closer to zero. This helps to stabilize
+      model training.
 
   Returns:
     Tensor with shape q.shape - key_dim + value_dim
@@ -77,12 +81,29 @@ def attention(q,
   logits = mtf.layers.us_einsum([q, k], reduced_dims=[key_dim])
   if bias is not None:
     logits += mtf.cast(bias, logits.dtype)
+
+  # Adds auxiliary z-loss to push the attention logits towards zero.
+  if z_loss_coeff is not None and context.train:
+    tf.logging.info("attention z_loss being added: {}".format(
+        tf.get_variable_scope().name))
+    log_z = mtf.reduce_logsumexp(logits, memory_length_dim)
+    z_loss = mtf.square(log_z) * mtf.cast(context.nonpadding, log_z.dtype)
+    z_loss = mtf.reduce_mean(z_loss)
+    if context.num_microbatches and context.num_microbatches > 1:
+      tf.logging.info(
+          "Dividing attention z-loss loss by num_microbatches={}".format(
+              context.num_microbatches))
+      z_loss /= context.num_microbatches
+    if context.train:
+      mtf.scalar_summary("attention_z_loss", z_loss)
+    z_loss *= z_loss_coeff
+    context.losses.append(mtf.cast(z_loss, v.dtype))
+
   weights = mtf.softmax(logits, memory_length_dim, extra_logit=extra_logit)
   weights = mtf.cast(weights, v.dtype)
-  if dropout_rate != 0.0:
-    weights = mtf.dropout(
-        weights, 1.0 - dropout_rate,
-        noise_shape=weights.shape - dropout_broadcast_dims)
+  weights = mtf.dropout(
+      weights, context.train, 1.0 - dropout_rate,
+      noise_shape=weights.shape - dropout_broadcast_dims)
   outputs_shape = q.shape - key_dim + value_dim
   outputs = mtf.einsum([weights, v], outputs_shape)
   outputs = mtf.reshape(outputs, orig_q_shape - key_dim + value_dim)
@@ -150,10 +171,9 @@ def hybrid_attention(q,
       lower_log_weights, memory_length_dim, extra_logit=extra_logit)
 
   weights = doubly_coeff * doubly_weights + (1. - doubly_coeff) * upper_weights
-  if dropout_rate != 0.0:
-    weights = mtf.dropout(
-        weights, 1.0 - dropout_rate,
-        noise_shape=weights.shape - dropout_broadcast_dims)
+  weights = mtf.dropout(
+      weights, context.train, 1.0 - dropout_rate,
+      noise_shape=weights.shape - dropout_broadcast_dims)
   outputs_shape = q.shape - key_dim + value_dim
   outputs = mtf.einsum([weights, v], outputs_shape)
   return outputs
@@ -328,10 +348,9 @@ def synthetic_attention(q,
     logits += bias
 
   weights = mtf.softmax(logits, memory_length_dim, extra_logit=extra_logit)
-  if dropout_rate != 0.0:
-    weights = mtf.dropout(
-        weights, 1.0 - dropout_rate,
-        noise_shape=weights.shape - dropout_broadcast_dims)
+  weights = mtf.dropout(
+      weights, context.train, 1.0 - dropout_rate,
+      noise_shape=weights.shape - dropout_broadcast_dims)
 
   if synthesize and "plus" not in synthesize_mode:
     if synthesize_mode == "dense_minus":
@@ -614,7 +633,8 @@ class ExpertsAttentionParams(AttentionParams):
                keep_query_heads_dims=False,
                fold_scaling_into_initializer=True,
                context=None,
-               experts_hparams=None):
+               experts_hparams=None,
+               expert_computation="qkv"):
     super(ExpertsAttentionParams, self).__init__(
         mesh=mesh,
         query_input_dim=query_input_dim,
@@ -634,17 +654,48 @@ class ExpertsAttentionParams(AttentionParams):
         make_attention_vars=False)
 
     self.context = context
+    self.expert_computation = expert_computation
+
+    # Unless we want to compute both q and kv, we can use the normal MoE
+    # settings.
+    if expert_computation == "qkv":
+      experts_attention_compute_qkv = True
+    elif expert_computation in ["q", "kv"]:
+      experts_attention_compute_qkv = False
+      if expert_computation == "q":
+        # Always assume shared_kv.
+        self.wkv = mtf.get_variable(
+            self.mesh,
+            "kv",
+            self.k_shape,
+            initializer=tf.random_normal_initializer(
+                stddev=self.memory_input_dim.size ** -0.5),
+            dtype=self.variable_dtype)
+      else:  # Computing kv with experts.
+        self.wq = mtf.get_variable(
+            self.mesh,
+            "q",
+            self.q_shape,
+            initializer=tf.random_normal_initializer(
+                stddev=self.query_input_dim.size ** -0.5),
+            dtype=self.variable_dtype)
+    else:
+      raise ValueError("Invalid expert computation mode: {}".format(
+          expert_computation))
 
     # ExpertsAttention, for simplicitly, asserts that combine_dims is True, and
     # for efficiency, that shared_kv is True.
     if not self.combine_dims:
-      raise ValueError("self.combine_dims must be True for ExpertsAttention")
+      raise ValueError("combine_dims must be True for ExpertsAttention.")
     if not self.shared_kv:
-      raise ValueError("self.shared_kv must be True for ExpertsAttention")
+      raise ValueError("shared_kv must be True for ExpertsAttention.")
     if mtf.layers.unit_scaling_convention():
       raise NotImplementedError
 
-    moe_output_dims = self.q_shape[-1]
+    # Now replace "heads" dim with the "d_model" name to avoid conflicts when
+    # we want to partition both "experts_hidden" and "heads".
+    moe_output_dims = mtf.Dimension("d_model", self.q_shape[-1].size)
+
     tf.logging.info("ExpertsAttention moe_hidden_size: {}".format(
         experts_hparams.hidden_size))
     tf.logging.info("moe_output_dims: {}".format(moe_output_dims))
@@ -656,22 +707,47 @@ class ExpertsAttentionParams(AttentionParams):
         min_expert_capacity=experts_hparams.min_expert_capacity,
         capacity_factor_train=experts_hparams.capacity_factor_train,
         capacity_factor_eval=experts_hparams.capacity_factor_eval,
-        rand_1_policy_train=experts_hparams.rand_1_policy_train,
-        rand_1_policy_eval=experts_hparams.rand_1_policy_eval,
-        rand_1_dropout=experts_hparams.rand_1_dropout,
-        rand_1_temperature=experts_hparams.rand_1_temperature,
-        rand_1_jitter=experts_hparams.rand_1_jitter,
-        switch_top_k=experts_hparams.switch_top_k,
+        switch_policy_train=experts_hparams.switch_policy_train,
+        switch_policy_eval=experts_hparams.switch_policy_eval,
+        switch_dropout=experts_hparams.switch_dropout,
+        switch_temperature=experts_hparams.switch_temperature,
+        switch_jitter=experts_hparams.switch_jitter,
+        ntlb_top_k=experts_hparams.ntlb_top_k,
         hidden_size=experts_hparams.hidden_size,
         output_dim=moe_output_dims,
-        use_experts_attention=experts_hparams.use_experts_attention)
+        use_experts_attention=experts_attention_compute_qkv,
+        activation=experts_hparams.activation,
+        z_loss=experts_hparams.z_loss)
 
   def _compute_merge_qkv(self, antecedent):
     """Computes qkv all in one call using MoE layer."""
-    # NOTE: This assumes querty and memory antecedent are the same
-    qk = self.moe_layer.call(self.context, antecedent)
-    # Split qk here since they went through experts-layers
-    q, k = qk
+    def _replace_d_model_dim(t):
+      """Used to replace the `d_model` dim with `heads`."""
+      new_last_dim = mtf.Dimension(self.q_shape[-1].name, t.shape[-1].size)
+      return mtf.reshape(
+          t, new_shape=mtf.Shape(t.shape[:-1] + [new_last_dim]))
+    if self.expert_computation == "qkv":
+      # NOTE: This assumes querty and memory antecedent are the same
+      qk = self.moe_layer.call(self.context, antecedent)
+      # Split qk here since they went through experts-layers
+      q, k = qk
+      q = _replace_d_model_dim(q)
+      k = _replace_d_model_dim(k)
+    elif self.expert_computation == "q":
+      q = self.moe_layer.call(self.context, antecedent)
+      q = _replace_d_model_dim(q)
+      # Compute key/value normally
+      k = mtf.layers.us_einsum(
+          [antecedent, self.wkv], reduced_dims=[self.memory_input_dim])
+    elif self.expert_computation == "kv":
+      k = self.moe_layer.call(self.context, antecedent)
+      k = _replace_d_model_dim(k)
+      # Compute query normally
+      q = mtf.layers.us_einsum(
+          [antecedent, self.wq], reduced_dims=[self.query_input_dim])
+    else:
+      raise ValueError("Invalid expert computation mode: {}".format(
+          self.expert_computation))
 
     # Scale query
     q *= self.key_dim.size ** -0.5
@@ -925,3 +1001,317 @@ def maybe_reshape_attention_input_for_2d_sharding(
     else:
       return x
   return _my_reshape(q), _my_reshape(k), _my_reshape(v), _my_reshape(bias)
+
+
+def make_params_mtlprompt(task_num,
+                          num_heads,
+                          prefix_hidden_dim,
+                          kv_dim,
+                          context,
+                          mtlprompt_share,
+                          dropout_rate,
+                          prompt_length=None):
+  """Returns the parameters for MTL-Prompt mode."""
+
+  tf.logging.info("MTL-Prompt mode is ON!")
+  # Get task ids for the batch from the context cache.
+  task_id = context.cache["task-id"]
+
+  # Remove length dim from shape [batch_size, length] -> [batch_size].
+  task_id = mtf.reshape(task_id, task_id.shape - task_id.shape.dims[-1])
+  batch_size_dim = task_id.shape.get_dim_by_name("batch")
+
+  task_num_dim = mtf.Dimension("task_num", task_num)
+  prompt_length_dim = mtf.Dimension("memory_length", prompt_length)
+  heads_dim = mtf.Dimension("heads", num_heads)
+  prefix_hidden_dim = mtf.Dimension("prefix_hidden", prefix_hidden_dim)
+
+  with tf.variable_scope("prompt"):
+    # Initialize projection network matrices.
+
+    # MTL-Prompt-Share mode.
+    hidden_shape = [context.model.model_dim, prefix_hidden_dim]
+    scratch_shape = [prefix_hidden_dim, heads_dim, kv_dim]
+    if not mtlprompt_share:
+      # MTL-Prompt-Sep mode.
+      hidden_shape = [task_num_dim] + hidden_shape
+      scratch_shape = [task_num_dim] + scratch_shape
+
+    w_k_up = mtf.get_variable(
+        context.mesh,
+        "w_k_up",
+        mtf.Shape(hidden_shape),
+        dtype=context.variable_dtype)
+    w_k_down = mtf.get_variable(
+        context.mesh,
+        "w_k_down",
+        mtf.Shape(scratch_shape),
+        dtype=context.variable_dtype)
+    w_v_up = mtf.get_variable(
+        context.mesh,
+        "w_v_up",
+        mtf.Shape(hidden_shape),
+        dtype=context.variable_dtype)
+    w_v_down = mtf.get_variable(
+        context.mesh,
+        "w_v_down",
+        mtf.Shape(scratch_shape),
+        dtype=context.variable_dtype)
+
+  scope_name = tf.get_variable_scope().name
+  scope = scope_name.split("/")[0]
+  prompts = context.shared_params[scope]["prompts"]
+  prompts = mtf.layers.layer_norm(
+      prompts, dim=context.model.model_dim, name="prompts_layernorm")
+  if context.train and dropout_rate != 0.0:
+    prompts = mtf.dropout(prompts, context.train, 1.0 - dropout_rate)
+
+  prompts_k_hidden = mtf.matmul(
+      prompts,
+      w_k_up,
+      output_shape=[task_num_dim, prompt_length_dim, prefix_hidden_dim],
+      reduced_dims=[context.model.model_dim])
+  prompts_k_hidden = mtf.relu(prompts_k_hidden)
+  if context.train and dropout_rate != 0.0:
+    prompts_k_hidden = mtf.dropout(
+        prompts_k_hidden, context.train, keep_prob=1.0 - dropout_rate)
+  prompts_k = mtf.matmul(
+      prompts_k_hidden,
+      w_k_down,
+      output_shape=[task_num_dim, prompt_length_dim, heads_dim, kv_dim],
+      reduced_dims=[prefix_hidden_dim])
+
+  prompts_v_hidden = mtf.matmul(
+      prompts,
+      w_v_up,
+      output_shape=[task_num_dim, prompt_length_dim, prefix_hidden_dim],
+      reduced_dims=[context.model.model_dim])
+  prompts_v_hidden = mtf.relu(prompts_v_hidden)
+  if context.train and dropout_rate != 0.0:
+    prompts_v_hidden = mtf.dropout(
+        prompts_v_hidden, context.train, keep_prob=1.0 - dropout_rate)
+  prompts_v = mtf.matmul(
+      prompts_v_hidden,
+      w_v_down,
+      output_shape=[task_num_dim, prompt_length_dim, heads_dim, kv_dim],
+      reduced_dims=[prefix_hidden_dim])
+
+  prompts_batch_k = mtf.gather(
+      prompts_k,
+      task_id,
+      task_num_dim,
+      output_shape=[batch_size_dim, prompt_length_dim, heads_dim, kv_dim])
+  prompts_batch_v = mtf.gather(
+      prompts_v,
+      task_id,
+      task_num_dim,
+      output_shape=[batch_size_dim, prompt_length_dim, heads_dim, kv_dim])
+  return prompts_batch_k, prompts_batch_v
+
+
+def make_params_hyperprompt(task_num,
+                            num_heads,
+                            prefix_hidden_dim,
+                            kv_dim,
+                            context,
+                            mtlprompt_share,
+                            dropout_rate,
+                            prompt_length,
+                            scope=None):
+  """Returns the parameters for HyperPrompt mode."""
+  del mtlprompt_share
+  tf.logging.info("HyperPrompt mode is ON!")
+  # Get task ids for the batch from the context cache.
+  task_id = context.cache["task-id"]
+
+  # Remove length dim from shape [batch_size, length].
+  task_id = mtf.reshape(task_id, task_id.shape - task_id.shape.dims[-1])
+
+  batch_size_dim = [dim for dim in task_id.shape.dims if dim.name == "batch"][0]
+
+  task_num_dim = mtf.Dimension("task_num", task_num)
+  prompt_length_dim = mtf.Dimension("memory_length", prompt_length)
+  heads_dim = mtf.Dimension("heads", num_heads)
+  prefix_hidden_dim = mtf.Dimension("prefix_hidden", prefix_hidden_dim)
+
+  prompts = context.shared_params[scope]["prompts"]
+  prompts = mtf.layers.layer_norm(
+      prompts, dim=context.model.model_dim, name="prompts_layernorm")
+  if context.train and dropout_rate != 0.0:
+    prompts = mtf.dropout(prompts, context.train, 1.0 - dropout_rate)
+
+  scope_name = tf.get_variable_scope().name
+  scope = scope_name.split("/")[0]
+
+  # Get the layer id.
+  layer_id = int(scope_name.split("/")[1].split("_")[1])
+
+  task_raw_embeddings = context.shared_params[scope]["task_raw_embedding"]
+  task_raw_embedding_dim = task_raw_embeddings.shape.dims[1]
+
+  task_projector_layer_one = context.shared_params[scope][
+      "task_projector_layer_one"]
+  task_projector_layer_one_in_dim = task_projector_layer_one.shape.dims[0]
+  task_hidden_dim = task_projector_layer_one.shape.dims[1]
+
+  task_projector_layer_two = context.shared_params[scope][
+      "task_projector_layer_two"]
+  task_final_embedding_dim = task_projector_layer_two.shape.dims[1]
+
+  layer_id_embeddings = context.shared_params[scope]["layer_embedding"]
+  layer_num_dim = layer_id_embeddings.shape.dims[0]
+  layer_id_embedding_dim = layer_id_embeddings.shape.dims[1]
+
+  # Get the layer id embedding for the batch.
+  if layer_id not in range(0, layer_num_dim.size):
+    raise ValueError("encounter errors in parsing scope get layer_id.")
+  layer_id_task_num = mtf.constant(
+      task_raw_embeddings.mesh,
+      layer_id,
+      shape=mtf.Shape([task_num_dim]),
+      dtype=tf.int32)
+  layer_id_emb_task_num = mtf.gather(
+      layer_id_embeddings,
+      layer_id_task_num,
+      layer_num_dim,
+      output_shape=[task_num_dim, layer_id_embedding_dim])
+
+  task_embeddings_concat = mtf.concat(
+      [task_raw_embeddings, layer_id_emb_task_num],
+      concat_dim_name=task_raw_embedding_dim.name)
+
+  # Feed raw task-embedding to MLP to obtain the layer-aware task embedding.
+  task_embeddings_concat_hidden = mtf.matmul(
+      task_embeddings_concat,
+      task_projector_layer_one,
+      output_shape=[task_num_dim, task_hidden_dim],
+      reduced_dims=[task_projector_layer_one_in_dim])
+  task_embeddings_concat_hidden_relu = mtf.relu(task_embeddings_concat_hidden)
+
+  if context.train and dropout_rate != 0.0:
+    task_embeddings_concat_hidden_relu = mtf.dropout(
+        task_embeddings_concat_hidden_relu,
+        context.train,
+        keep_prob=1.0 - dropout_rate)
+
+  task_embeddings_layer_awared = mtf.matmul(
+      task_embeddings_concat_hidden_relu,
+      task_projector_layer_two,
+      output_shape=[task_num_dim, task_final_embedding_dim],
+      reduced_dims=[task_hidden_dim])
+
+  task_embeddings_layer_awared = mtf.layers.layer_norm(
+      task_embeddings_layer_awared,
+      dim=task_final_embedding_dim,
+      name="prompt_task_embed_layernorm")
+
+  hypernet_w_k_up = context.shared_params[scope]["hypernet_w_k_up"]
+  hypernet_w_k_down = context.shared_params[scope]["hypernet_w_k_down"]
+  hypernet_w_v_up = context.shared_params[scope]["hypernet_w_v_up"]
+  hypernet_w_v_down = context.shared_params[scope]["hypernet_w_v_down"]
+
+  # Hypernetwork generates the prompts transformation
+  w_k_up = mtf.matmul(
+      task_embeddings_layer_awared,
+      hypernet_w_k_up,
+      output_shape=[task_num_dim, context.model.model_dim, prefix_hidden_dim],
+      reduced_dims=[task_final_embedding_dim])
+
+  w_k_down = mtf.matmul(
+      task_embeddings_layer_awared,
+      hypernet_w_k_down,
+      output_shape=[task_num_dim, prefix_hidden_dim, heads_dim, kv_dim],
+      reduced_dims=[task_final_embedding_dim])
+
+  w_v_up = mtf.matmul(
+      task_embeddings_layer_awared,
+      hypernet_w_v_up,
+      output_shape=[task_num_dim, context.model.model_dim, prefix_hidden_dim],
+      reduced_dims=[task_final_embedding_dim])
+
+  w_v_down = mtf.matmul(
+      task_embeddings_layer_awared,
+      hypernet_w_v_down,
+      output_shape=[task_num_dim, prefix_hidden_dim, heads_dim, kv_dim],
+      reduced_dims=[task_final_embedding_dim])
+
+  prompts_k_hidden = mtf.matmul(
+      prompts,
+      w_k_up,
+      output_shape=[task_num_dim, prompt_length_dim, prefix_hidden_dim],
+      reduced_dims=[context.model.model_dim])
+  prompts_k_hidden = mtf.relu(prompts_k_hidden)
+  if context.train and dropout_rate != 0.0:
+    prompts_k_hidden = mtf.dropout(
+        prompts_k_hidden, context.train, keep_prob=1.0 - dropout_rate)
+  prompts_k = mtf.matmul(
+      prompts_k_hidden,
+      w_k_down,
+      output_shape=[task_num_dim, prompt_length_dim, heads_dim, kv_dim],
+      reduced_dims=[prefix_hidden_dim])
+  prompts_batch_k = mtf.gather(
+      prompts_k,
+      task_id,
+      task_num_dim,
+      output_shape=[batch_size_dim, prompt_length_dim, heads_dim, kv_dim])
+
+  prompts_v_hidden = mtf.matmul(
+      prompts,
+      w_v_up,
+      output_shape=[task_num_dim, prompt_length_dim, prefix_hidden_dim],
+      reduced_dims=[context.model.model_dim])
+  prompts_v_hidden = mtf.relu(prompts_v_hidden)
+  if context.train and dropout_rate != 0.0:
+    prompts_v_hidden = mtf.dropout(
+        prompts_v_hidden, context.train, keep_prob=1.0 - dropout_rate)
+  prompts_v = mtf.matmul(
+      prompts_v_hidden,
+      w_v_down,
+      output_shape=[task_num_dim, prompt_length_dim, heads_dim, kv_dim],
+      reduced_dims=[prefix_hidden_dim])
+  prompts_batch_v = mtf.gather(
+      prompts_v,
+      task_id,
+      task_num_dim,
+      output_shape=[batch_size_dim, prompt_length_dim, heads_dim, kv_dim])
+
+  return prompts_batch_k, prompts_batch_v
+
+
+def concat_hyper_prompts_kv(k, v, scope_encoder_or_decoder, use_hyperprompt,
+                            memory_length, task_num, num_heads,
+                            prefix_hidden_dim, kv_dim, context, mtlprompt_share,
+                            dropout_rate, prompt_length):
+  """Performs the concatenation of hyper prompts to key and value."""
+  # Inject hyper-prompts into keys and values.
+  if use_hyperprompt:
+    # HyperPrompt mode.
+    prompts_batch_k, prompts_batch_v = make_params_hyperprompt(
+        task_num,
+        num_heads,
+        prefix_hidden_dim,
+        kv_dim,
+        context,
+        mtlprompt_share,
+        dropout_rate,
+        prompt_length=prompt_length,
+        scope=scope_encoder_or_decoder)
+  else:
+    # MTL-Prompt mode.
+    prompts_batch_k, prompts_batch_v = make_params_mtlprompt(
+        task_num,
+        num_heads,
+        prefix_hidden_dim,
+        kv_dim,
+        context,
+        mtlprompt_share,
+        dropout_rate,
+        prompt_length=prompt_length)
+
+  k = mtf.concat([prompts_batch_k, k], concat_dim_name="memory_length")
+  v = mtf.concat([prompts_batch_v, v], concat_dim_name="memory_length")
+  memory_length = mtf.Dimension("memory_length",
+                                memory_length.size + prompt_length)
+  memory_position = mtf.range(context.mesh, memory_length, tf.int32)
+
+  return k, v, memory_position, memory_length

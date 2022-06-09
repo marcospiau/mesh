@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The Mesh TensorFlow Authors.
+# Copyright 2022 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,10 +25,16 @@ from __future__ import division
 from __future__ import print_function
 
 import functools
+import itertools
+import math
 import os
 import random
 import re
+<<<<<<< HEAD
 import torch
+=======
+import time
+>>>>>>> 6d440456e4d0d474b07546c8cf06eb83409b2bf1
 
 import gin
 import gin.tf
@@ -43,6 +49,7 @@ import numpy as np
 import pkg_resources
 import six
 import tensorflow.compat.v1 as tf
+from tensorflow.compat.v1 import estimator as tf_estimator
 import tensorflow_datasets as tfds
 
 from tensorflow.core.protobuf import rewriter_config_pb2  # pylint: disable=g-direct-tensorflow-import
@@ -50,9 +57,12 @@ from tensorflow.python.ops import resources  # pylint: disable=g-direct-tensorfl
 from tensorflow.python.tpu import tpu_config  # pylint: disable=g-direct-tensorflow-import
 from tensorflow.python.tpu import tpu_estimator  # pylint: disable=g-direct-tensorflow-import
 
-tf.flags.DEFINE_multi_string("gin_file", None, "Path to a Gin file.")
-tf.flags.DEFINE_multi_string("gin_param", None, "Gin parameter binding.")
-tf.flags.DEFINE_list("gin_location_prefix", [], "Gin file search path.")
+try:
+  tf.flags.DEFINE_multi_string("gin_file", None, "Path to a Gin file.")
+  tf.flags.DEFINE_multi_string("gin_param", None, "Gin parameter binding.")
+  tf.flags.DEFINE_list("gin_location_prefix", [], "Gin file search path.")
+except tf.flags.DuplicateFlagError:
+  pass
 
 FLAGS = tf.flags.FLAGS
 
@@ -147,11 +157,20 @@ def separate_vocabularies(inputs=gin.REQUIRED, targets=gin.REQUIRED):
 
 @gin.configurable
 def init_checkpoint_variable_mapping(name, mapping_fn=None):
-  """Maps from varaible name in graph to variable name in checkpoint."""
+  """Maps from variable name in graph to variable name in checkpoint."""
   if mapping_fn:
     return mapping_fn(name)
   else:
     return name
+
+
+@gin.configurable
+def should_load_variable(name, filter_fn=None):
+  """Determines whether a global variable should be loaded from a ckpt."""
+  if filter_fn:
+    return filter_fn(name)
+  else:
+    return True
 
 
 # TODO(katherinelee): Update layout_rules string when noam updates the
@@ -258,8 +277,11 @@ def tpu_mesh_shape(tpu_topology=gin.REQUIRED,
   if tpu_topology.startswith("v"):
     num_cores = int(tpu_topology.split("-")[-1])
   else:
-    x, y = tpu_topology.split("x")
-    num_cores = int(x) * int(y) * 2
+    # check for twisted topologies
+    tpu_topology = re.split("_twisted|_untwisted", tpu_topology)[0]
+    tpu_dim = [int(x) for x in tpu_topology.split("x")]
+    num_cores = functools.reduce(lambda x, y: x * y,
+                                 tpu_dim) * FLAGS.logical_cores_per_chip
   if isinstance(model_parallelism, list):
     # model_parallelism is actually a spec used to
     # construct a simd_mesh_impl.HierarchicalTiling object
@@ -283,7 +305,206 @@ def variable_filter_max_size(v, max_size=1e7):
   return v.size <= max_size
 
 
+def _build_ckpt_to_local_var_name_mapping(
+    ckpt_num_blocks, ckpt_num_layers, local_num_blocks,
+    local_num_layers, new_layers, regex_prefix=None):
+  """Builds a mapping from checkpoint variable names to local variable names.
+
+  Args:
+    ckpt_num_blocks: an integer, number of blocks in checkpoint.
+    ckpt_num_layers: an integer, number of layers in checkpoint.
+    local_num_blocks: an integer, number of blocks in current model.
+    local_num_layers: an integer, number of layers in current model.
+    new_layers: a list of lists, specifying new layer indices in the current
+      model not present in the ckpt.
+    regex_prefix: optional, a string, specifying a prefix to match for
+      both checkpoint variables and ones in the current model.
+
+  Returns:
+    a dictionary where keys are checkpoint variable name regexes and
+    values are local variable name regexes. It specifies the mapping between
+    the checkpoint block/layer group and local block/layer group.
+  """
+  def build_regex(layer_num, block_num, num_blocks):
+    base_regex = r"layer_{:0=3d}".format(layer_num)
+    if num_blocks is not None:
+      base_regex = r"block_{:0=3d}/".format(block_num) + base_regex
+    if regex_prefix is not None:
+      base_regex = regex_prefix + r".*" + base_regex
+    return base_regex
+
+  all_ckpt_name_regexes = []
+  for block_num in range(ckpt_num_blocks or 1):
+    for layer_num in range(ckpt_num_layers):
+      all_ckpt_name_regexes.append(
+          build_regex(layer_num, block_num, ckpt_num_blocks))
+
+  all_local_name_regexes = []
+  for block_num in range(local_num_blocks or 1):
+    for layer_num in range(local_num_layers):
+      # Skip the new layers in the mapping ordering.
+      if (new_layers is not None) and (layer_num in new_layers): continue
+      all_local_name_regexes.append(
+          build_regex(layer_num, block_num, local_num_blocks))
+
+  if len(all_ckpt_name_regexes) != len(all_local_name_regexes):
+    raise ValueError("Invalid checkpoint to load. Number of variables in ckpt "
+                     "and current model (minus `new_layers`) must be equal.")
+
+  # Build a mapping from ckpt var regex to local var regex.
+  ckpt_var_name_to_local_var_name = {}
+  for ckpt_var_name, local_var_name in zip(
+      all_ckpt_name_regexes, all_local_name_regexes):
+    ckpt_var_name_to_local_var_name[ckpt_var_name] = local_var_name
+  return ckpt_var_name_to_local_var_name
+
+
+def _match_ckpt_to_local_var_name(
+    ckpt_var_name, local_var_name, ckpt_var_name_to_local_var_name):
+  """Returns True if this pair of vars should be loaded, False otherwise."""
+  # Name does not fall into the block/layer convention, so return identity.
+  # This will cover variable such as the global_step, embeddings, etc...
+  if "layer" not in ckpt_var_name or "layer" not in local_var_name:
+    return ckpt_var_name == local_var_name
+
+  # If the variable suffixes do not match they cannot be matched.
+  if ckpt_var_name.split("/")[-1] != local_var_name.split("/")[-1]:
+    return False
+
+  for ckpt_regex, var_regex in ckpt_var_name_to_local_var_name.items():
+    if (re.match(ckpt_regex, ckpt_var_name) and
+        re.match(var_regex, local_var_name)):
+      # Both ckpt and local var are the same layer/block group. Now check to
+      # see if its the same parameter in the layer/block group.
+      if ".*" in ckpt_regex:
+        ckpt_regex = ckpt_regex.split(".*")[1]
+      if ".*" in var_regex:
+        var_regex = var_regex.split(".*")[1]
+      if ckpt_var_name.replace(ckpt_regex, var_regex) == local_var_name:
+        return True
+  return False
+
+
+def _compute_num_blocks_and_layer(var_names):
+  """Takes list of variable names and outputs the max number of blocks/layers."""
+
+  encoder_decoder_model = any(
+      [re.match(r"^encoder/", var_name) for var_name in var_names])
+
+  def get_max_layer_or_block_num(regex, var_names):
+    matched_nums = [re.findall(regex, v) for v in var_names]
+    return max(
+        [int(num) + 1 for num in list(itertools.chain(*matched_nums))] + [-1])
+
+  if encoder_decoder_model:
+    enc_max_layer_num = get_max_layer_or_block_num(
+        r"encoder/.*layer_(\d{3})", var_names)
+    enc_max_block_num = get_max_layer_or_block_num(
+        r"encoder/.*block_(\d{3})", var_names)
+    dec_max_layer_num = get_max_layer_or_block_num(
+        r"decoder/.*layer_(\d{3})", var_names)
+    dec_max_block_num = get_max_layer_or_block_num(
+        r"decoder/.*block_(\d{3})", var_names)
+    max_layer_num = [enc_max_layer_num, dec_max_layer_num]
+    max_block_num = [enc_max_block_num, dec_max_block_num]
+  else:
+    max_layer_num = [get_max_layer_or_block_num(r"layer_(\d{3})", var_names)]
+    max_block_num = [get_max_layer_or_block_num(r"block_(\d{3})", var_names)]
+
+  max_block_num = [n if (n != -1) else None for n in max_block_num]
+  return max_block_num, max_layer_num
+
+
 @gin.configurable
+def flexible_ckpt_init_mapping(ckpt_path="", new_layers=None,
+                               return_mapping_fn=True):
+  """More flexibly handles loading a checkpoint.
+
+  To be used as a mapping_fn in init_checkpoint_variable_mapping or as a
+  filter_fn in should_load_variable depending on return_mapping_fn.
+
+  Covers three common cases when initializing a checkpoint:
+  (1) Loading a checkpoint that contains different block/layer numbering.
+  (2) Inserting new layers in into the current model that should not be loaded
+      from the checkpoint (e.g. inserting an extra DenseReLUDense layer in each
+      block group for the current model).
+  (3) Changing the layer type from the ckpt in the current model
+      (e.g. replacing a DenseReLUDense layer with an MoE1D layer).
+
+  Args:
+    ckpt_path: string, saved checkpoint path to load.
+    new_layers: optional list of lists specifing what numbers in the layer stack
+      are newly added in the current model. These should be skipped when loading
+      the checkpoint weights. If Enc-Dec model the list will contains two lists,
+      one for new encoder layers and the other for decoder layer
+      (e.g. [[3], [1]]). If LM then just a single list (e.g. [[3]]).
+    return_mapping_fn: a boolean, if True then return a function mapping from
+      the graph variable names to the checkpoint variable names that should be
+      loaded in. If False, then return a filter_fn that will return whether
+      a graph variable should be loaded from the ckpt.
+
+  Returns:
+    if return_mapping_fn is True then return a function mapping from
+    the graph variable names to the checkpoint variable names.
+    If False, then return a filter_fn that will return whether a graph
+    variable should be loaded from the ckpt.
+  """
+  tf.logging.info("Using flexible_ckpt_init_mapping.")
+  ckpt_var_names = [v for v, _ in tf.train.list_variables(ckpt_path)]
+  local_var_names = [v.op.name for v in tf.global_variables()]
+
+  # `num_blocks` and `num_layers` will be tuples of length two for
+  # encoder-decoder models and length 1 for LMs.
+  ckpt_num_blocks, ckpt_num_layers = _compute_num_blocks_and_layer(
+      ckpt_var_names)
+  local_num_blocks, local_num_layers = _compute_num_blocks_and_layer(
+      local_var_names)
+
+  # Create regex mapping from ckpt variable names to local variable names.
+  mappings = []
+  if len(ckpt_num_blocks) == 2:
+    # Encoder-Decoder Model.
+    new_enc_layers, new_dec_layers = None, None
+    if new_layers is not None:
+      new_enc_layers, new_dec_layers = new_layers
+    enc_mapping = _build_ckpt_to_local_var_name_mapping(
+        ckpt_num_blocks[0], ckpt_num_layers[0], local_num_blocks[0],
+        local_num_layers[0], new_enc_layers, regex_prefix="encoder/")
+    dec_mapping = _build_ckpt_to_local_var_name_mapping(
+        ckpt_num_blocks[1], ckpt_num_layers[1], local_num_blocks[1],
+        local_num_layers[1], new_dec_layers, regex_prefix="decoder/")
+    mappings = [enc_mapping, dec_mapping]
+  else:
+    # LM Model.
+    new_lm_layers = None
+    if new_layers is not None:
+      new_lm_layers = new_layers[0]
+    lm_mapping = _build_ckpt_to_local_var_name_mapping(
+        ckpt_num_blocks[0], ckpt_num_layers[0], local_num_blocks[0],
+        local_num_layers[0], new_lm_layers)
+    mappings = [lm_mapping]
+
+  graph_var_to_ckpt_var = {}
+  for ckpt_var_name in ckpt_var_names:
+    for local_var_name in local_var_names:
+      for mapping in mappings:
+        if _match_ckpt_to_local_var_name(
+            ckpt_var_name, local_var_name, mapping):
+          graph_var_to_ckpt_var[local_var_name] = ckpt_var_name
+
+  def mapping_fn(var_name):
+    return graph_var_to_ckpt_var[var_name]
+
+  def filter_fn(var_name):
+    return var_name in graph_var_to_ckpt_var
+
+  if return_mapping_fn:
+    return mapping_fn
+  else:
+    return filter_fn
+
+
+@gin.configurable(denylist=["predict_fn"])  # pass `predict_fn` through `run`
 def tpu_estimator_model_fn(model_type,
                            transformer_model,
                            vocabulary,
@@ -308,7 +529,9 @@ def tpu_estimator_model_fn(model_type,
                            ensemble_inputs=None,
                            mesh_devices=None,
                            model_info_file=None,
-                           hierarchical_tiling_spec=None):
+                           hierarchical_tiling_spec=None,
+                           weight_decay_checkpoint=None  # GOOGLE-INTERNAL,
+                           ):
   """Create a TPUEstimator model function.
 
   Args:
@@ -350,7 +573,7 @@ def tpu_estimator_model_fn(model_type,
       if empty string (default), all variables from the checkpoint are loaded.
     ensemble_inputs: an optional integer - pass the size of the ensemble to
       train an ensemble where each model gets different inputs.
-      You also need to configure Unitransformer.ensemble  to the right size.
+      You also need to configure Unitransformer.ensemble to the right size.
       If None, then all models are trained on the same inputs.
     mesh_devices: a list of strings, the device names to use for each mesh
       slice. Only required for GPU.
@@ -358,6 +581,9 @@ def tpu_estimator_model_fn(model_type,
       operations will be logged to this file during the TRAIN mode.
     hierarchical_tiling_spec: an optional list that can be passed as the
       spec argument to simd_mesh_impl.HierarchicalTiling
+    weight_decay_checkpoint: an optional checkpoint dir to weight decay from.  #
+      GOOGE-INTERNAL
+
   Returns:
     a function to be passed to TPUEstimator
   """
@@ -379,7 +605,7 @@ def tpu_estimator_model_fn(model_type,
       a TPUEstimatorSpec
     """
     del labels, config
-    if mode == tf.estimator.ModeKeys.PREDICT and score_in_predict_mode:
+    if mode == tf_estimator.ModeKeys.PREDICT and score_in_predict_mode:
       mode = "score"
     global_step = tf.train.get_global_step()
     if use_tpu and "context" in params:
@@ -396,17 +622,21 @@ def tpu_estimator_model_fn(model_type,
                                                     devices_memeory_usage)
       physical_shape = [int(i) for i in
                         params["context"].device_assignment.topology.mesh_shape]
+      mesh_4d = False
       if len(physical_shape) == 4:
+        mesh_4d = True if physical_shape[2] > 1 else False
         physical_shape = (
             mtf.simd_mesh_impl.physical_shape_3d_from_topology_proto_4d(
                 physical_shape))
-      if hierarchical_tiling_spec is not None:
+      if mesh_4d or hierarchical_tiling_spec is None:
+        logical_to_physical = mtf.simd_mesh_impl.auto_logical_to_physical_tpu(
+            mesh_shape.to_integer_list,
+            physical_shape,
+            device_assignment=params["context"].device_assignment)
+      else:
         logical_to_physical = mtf.simd_mesh_impl.HierarchicalTiling(
             hierarchical_tiling_spec,
             physical_shape).logical_to_physical
-      else:
-        logical_to_physical = mtf.simd_mesh_impl.auto_logical_to_physical_tpu(
-            mesh_shape.to_integer_list, physical_shape)
       mesh_impl = mtf.simd_mesh_impl.SimdMeshImpl(
           mesh_shape, layout_rules, mesh_devices, ctx.device_assignment,
           logical_to_physical=logical_to_physical)
@@ -419,7 +649,7 @@ def tpu_estimator_model_fn(model_type,
     mesh = mtf.Mesh(graph, "my_mesh", var_placer)
 
     if (outer_batch_size and
-        mode not in [tf.estimator.ModeKeys.PREDICT, "score"]):
+        mode not in [tf_estimator.ModeKeys.PREDICT, "score"]):
       outer_batch_dim = mtf.Dimension("outer_batch", outer_batch_size)
       batch_dim = mtf.Dimension("batch", batch_size // outer_batch_size)
       batch_dims = [outer_batch_dim, batch_dim]
@@ -445,7 +675,7 @@ def tpu_estimator_model_fn(model_type,
       x = tf.cast(features[key], tf.int32)
       x = tf.reshape(x, feature_shape.to_integer_list)
       if not use_tpu:
-        tf.logging.info("feature %s : %s" % (key, x))
+        tf.logging.info("feature %s : %s", key, x)
       mtf_features[key] = mtf.import_fully_replicated(
           mesh, x, feature_shape, name=key)
 
@@ -463,7 +693,7 @@ def tpu_estimator_model_fn(model_type,
         raise ValueError(message)
 
     # Verify that the right features exist, and transform them if necessary
-    if mode == tf.estimator.ModeKeys.PREDICT:
+    if mode == tf_estimator.ModeKeys.PREDICT:
       _verify_feature_exists("inputs", True)
       # "targets" may or may not exist depending on whether we are doing
       # evaluation or open-ended inference.
@@ -487,42 +717,44 @@ def tpu_estimator_model_fn(model_type,
       return ids
     if mode == "score":
       # compute log-likelihoods per sequence
+      targets = mtf_features["targets"]
       if predict_fn:
         # predict_fn contains a custom scoring function
-        # this code-path has not been tested
         scores = predict_fn(
             model=transformer_model,
             features=mtf_features,
             variable_dtype=get_variable_dtype())
-      targets = mtf_features["targets"]
-      if isinstance(transformer_model, transformer.Unitransformer):
-        length_dim = targets.shape.dims[-1]
-        inputs = transformer.autoregressive_inputs(
-            mtf_features["targets"])
-      elif isinstance(transformer_model,
-                      (transformer.Bitransformer,
-                       transformer.StudentTeacher)):
-        inputs = mtf_features["inputs"]
       else:
-        raise ValueError("unrecognized class")
-      logits, _ = transformer_model.call_simple(
-          inputs=inputs,
-          targets=targets,
-          compute_loss=False,
-          mode=mode,
-          variable_dtype=get_variable_dtype())
-      logits = mtf.cast(logits, tf.float32)
-      _, length_dim, vocab_dim = logits.shape.dims
+        if isinstance(transformer_model, transformer.Unitransformer):
+          length_dim = targets.shape.dims[-1]
+          inputs = transformer.autoregressive_inputs(
+              mtf_features["targets"])
+        elif isinstance(transformer_model,
+                        (transformer.Bitransformer,
+                         transformer.StudentTeacher)):
+          inputs = mtf_features["inputs"]
+        else:
+          raise ValueError("unrecognized class")
+        logits, _ = transformer_model.call_simple(
+            inputs=inputs,
+            targets=targets,
+            compute_loss=False,
+            mode=mode,
+            variable_dtype=get_variable_dtype())
+        logits = mtf.cast(logits, tf.float32)
+        _, length_dim, vocab_dim = logits.shape.dims
 
-      cross_entropy = mtf.layers.softmax_cross_entropy_with_logits(
-          logits, mtf_features["targets"], vocab_dim)
-      # 0=padding and negative targets are a hack to indicate no loss
-      cross_entropy *= mtf.cast(
-          mtf.greater(targets, 0), cross_entropy.dtype)
-      if model_type == "delimited_lm":
-        cross_entropy *= mtf.cast(mtf.logical_not(
-            transformer.delimited_lm_inputs_mask(targets)), cross_entropy.dtype)
-      scores = -mtf.reduce_sum(cross_entropy, reduced_dim=length_dim)
+        cross_entropy = mtf.layers.softmax_cross_entropy_with_logits(
+            logits, mtf_features["targets"], vocab_dim)
+        # 0=padding and negative targets are a hack to indicate no loss
+        cross_entropy *= mtf.cast(
+            mtf.greater(targets, 0), cross_entropy.dtype)
+        if model_type == "delimited_lm":
+          cross_entropy *= mtf.cast(mtf.logical_not(
+              transformer.delimited_lm_inputs_mask(targets)),
+                                    cross_entropy.dtype)
+        scores = -mtf.reduce_sum(cross_entropy, reduced_dim=length_dim)
+
       scores = mtf.anonymize(scores)
       targets = mtf.anonymize(targets)
       lowering = mtf.Lowering(graph, {mesh: mesh_impl}, autostack=autostack)
@@ -533,7 +765,7 @@ def tpu_estimator_model_fn(model_type,
           "targets": targets,
           "scores": lowering.export_to_tf_tensor(scores)
       }
-    elif mode == tf.estimator.ModeKeys.PREDICT:
+    elif mode == tf_estimator.ModeKeys.PREDICT:
       inputs = mtf_features["inputs"]
       if predict_fn:
         mtf_samples = predict_fn(
@@ -574,7 +806,7 @@ def tpu_estimator_model_fn(model_type,
           "outputs": outputs,
           "scores": scores}
 
-    if mode in ["score", tf.estimator.ModeKeys.PREDICT]:
+    if mode in ["score", tf_estimator.ModeKeys.PREDICT]:
       # When exporting a model, we need to communicate to TF-Serving that
       # master variables need to be copied to their slave slice variables.
       # Estimator uses a Scaffold's "local_init_op" for this purpose, so we
@@ -599,13 +831,13 @@ def tpu_estimator_model_fn(model_type,
                 name="mtf_ready_op"))
 
       return tpu_estimator.TPUEstimatorSpec(
-          mode=tf.estimator.ModeKeys.PREDICT,
+          mode=tf_estimator.ModeKeys.PREDICT,
           predictions=predictions,
           scaffold_fn=scaffold_fn,
           prediction_hooks=[mtf.MtfRestoreHook(lowering)])
 
-    assert (mode == tf.estimator.ModeKeys.TRAIN or
-            mode == tf.estimator.ModeKeys.EVAL)
+    assert (mode == tf_estimator.ModeKeys.TRAIN or
+            mode == tf_estimator.ModeKeys.EVAL)
 
     def logits_and_loss(mtf_features, num_microbatches=1):
       """Compute logits and loss.
@@ -653,7 +885,7 @@ def tpu_estimator_model_fn(model_type,
           num_microbatches=num_microbatches,
           **position_kwargs)
 
-    if mode == tf.estimator.ModeKeys.TRAIN:
+    if mode == tf_estimator.ModeKeys.TRAIN:
       num_microbatches = serialize_num_microbatches(batch_dim,
                                                     sequence_length,
                                                     mesh_shape,
@@ -668,6 +900,7 @@ def tpu_estimator_model_fn(model_type,
         loss = logits_and_loss(mtf_features)[1]
         var_grads = mtf.gradients(
             [loss], [v.outputs[0] for v in graph.trainable_variables])
+
 
       if tpu_summaries:
         mtf.scalar_summary("loss", loss)
@@ -702,11 +935,8 @@ def tpu_estimator_model_fn(model_type,
         tf.logging.info("Variables not being trained:")
         tf.logging.info([v.name for v in graph.trainable_variables
                          if not variable_filter_fn(v)])
-
-      update_ops = optimizer(learning_rate=learning_rate).apply_grads(
-          trainable_var_grads, trainable_vars
-      )
-
+      opt = optimizer(learning_rate=learning_rate)
+      update_ops = opt.apply_grads(trainable_var_grads, trainable_vars)
       lowering = mtf.Lowering(
           graph, {mesh: mesh_impl},
           autostack=autostack,
@@ -744,21 +974,25 @@ def tpu_estimator_model_fn(model_type,
             ckpt_vars = {v for v in ckpt_vars if pattern.search(v)}
 
           global_vars = {v.op.name for v in tf.global_variables()}
+          filtered_global_vars = {
+              v for v in global_vars if should_load_variable(v)}
           restore_vars = {
-              v for v in global_vars if init_checkpoint_variable_mapping(v)
-              in ckpt_vars}
+              v for v in filtered_global_vars
+              if init_checkpoint_variable_mapping(v) in ckpt_vars}
           tf.logging.info("Initializing variables from %s:", init_checkpoint)
           tf.logging.debug("\n".join(sorted(restore_vars)))
           tf.logging.info("Variables in %s but not in graph:", init_checkpoint)
           tf.logging.info("\n".join(sorted(
               ckpt_vars -
-              {init_checkpoint_variable_mapping(v) for v in global_vars})))
+              {init_checkpoint_variable_mapping(v)
+               for v in filtered_global_vars})))
           tf.logging.info("Variables in graph but not in %s:", init_checkpoint)
           tf.logging.info("\n".join(sorted(global_vars - restore_vars)))
           tf.train.init_from_checkpoint(
               init_checkpoint,
               {init_checkpoint_variable_mapping(v): v for v in restore_vars}
           )
+
 
         # Copy master variables to slices. Must be called first.
         restore_hook = mtf.MtfRestoreHook(lowering)
@@ -779,28 +1013,26 @@ def tpu_estimator_model_fn(model_type,
         gin_config_saver_hook = gin.tf.GinConfigSaverHook(
             model_dir, summarize_config=True, include_step_in_filename=False)
 
+        training_hooks = [
+            restore_hook,
+            saver_hook,
+            gin_config_saver_hook,
+        ]
+
         if use_tpu:
           return tpu_estimator.TPUEstimatorSpec(
-              mode=tf.estimator.ModeKeys.TRAIN,
+              mode=tf_estimator.ModeKeys.TRAIN,
               loss=tf_loss,
               train_op=train_op,
               host_call=host_call,
-              training_hooks=[
-                  restore_hook,
-                  saver_hook,
-                  gin_config_saver_hook,
-              ])
+              training_hooks=training_hooks)
         else:
-          return tf.estimator.EstimatorSpec(
-              tf.estimator.ModeKeys.TRAIN,
+          return tf_estimator.EstimatorSpec(
+              tf_estimator.ModeKeys.TRAIN,
               loss=tf_loss,
               train_op=train_op,
-              training_chief_hooks=[
-                  restore_hook,
-                  saver_hook,
-                  gin_config_saver_hook,
-              ])
-    elif mode == tf.estimator.ModeKeys.EVAL:
+              training_chief_hooks=training_hooks)
+    elif mode == tf_estimator.ModeKeys.EVAL:
       # perplexity eval
       logits, loss = logits_and_loss(mtf_features)
       # compute cross-entropy while still on TPU to avoid having to outfeed the
@@ -858,7 +1090,7 @@ def tpu_estimator_model_fn(model_type,
       with mtf.utils.outside_all_rewrites():
         restore_hook = mtf.MtfRestoreHook(lowering)
       return tpu_estimator.TPUEstimatorSpec(
-          tf.estimator.ModeKeys.EVAL,
+          tf_estimator.ModeKeys.EVAL,
           evaluation_hooks=[restore_hook],
           loss=tf_loss,
           eval_metrics=eval_metrics)
@@ -994,7 +1226,13 @@ def _dynamic_text2self(mtf_features):
 
 def get_inputs_from_file(input_filename, ignore_comments=False):
   """Read data from file and strip new lines."""
-  inputs = [line.rstrip() for line in tf.io.gfile.GFile(input_filename)]
+  with tf.io.gfile.GFile(input_filename, "r") as f:
+    inputs = [line.rstrip() for line in f]
+
+  # If this is an empty file (because of stripping), return early.
+  if not inputs:
+    tf.logging.info("input file is empty after rstrip: %s", input_filename)
+    return []
 
   # Strip the last empty line.
   if not inputs[-1]:
@@ -1105,8 +1343,8 @@ def decode(estimator,
       targets_vocabulary) tuple
     checkpoint_path: an optional string
 
-  Returns:
-    list of decoded strings
+  Yields:
+    decoded strings
   """
   result_iter = estimator.predict(
       input_fn, checkpoint_path=checkpoint_path)
@@ -1116,12 +1354,12 @@ def decode(estimator,
       return value
     return vocab.decode([int(x) for x in value])
 
-  decodes = []
   for i, result in enumerate(result_iter):
     input_string = _maybe_detokenize(
         result["inputs"], inputs_vocabulary(vocabulary))
     output_string = _maybe_detokenize(
         result["outputs"], targets_vocabulary(vocabulary))
+<<<<<<< HEAD
 
     scores = result["scores"][0]
     scores = scores[[6136, 1176]].tolist()
@@ -1130,11 +1368,13 @@ def decode(estimator,
     score_string = probs.tolist()[1]
     output_string = f"{output_string}\t{score_string}"
     decodes.append(output_string)
+=======
+    yield output_string
+>>>>>>> 6d440456e4d0d474b07546c8cf06eb83409b2bf1
     if i & (i - 1) == 0:
       # LOG every power of 2.
-      tf.logging.info("decoded {}: {}".format(i, input_string))
-      tf.logging.info("            -> {}".format(output_string))
-  return decodes
+      tf.logging.info("decoded %s: %s", i, input_string)
+      tf.logging.info("            -> %s", output_string)
 
 
 @gin.configurable
@@ -1165,9 +1405,47 @@ def write_lines_to_file(lines, filename):
   """
   if tf.io.gfile.exists(filename):
     tf.io.gfile.remove(filename)
+  tf.io.gfile.makedirs(os.path.dirname(filename))
   with tf.io.gfile.GFile(filename, "w") as output_file:
     for line in lines:
       output_file.write("{}\n".format(str(line).replace("\n", " ")))
+
+
+def _get_combined_dataset_input_fn(
+    datasets, batch_size, sequence_length, check_for_metrics=False):
+  """Creates input function for estimator for inference, eval, and scoring.
+
+  Args:
+    datasets: A list of mesh_tensorflow.transformer.dataset.EvalDataset tuples.
+      These will get combined together into a single tf.data.Dataset.
+    batch_size: an integer
+    sequence_length: an integer or a dict from feature-key to integer
+      the (packed) sequence length, e.g. {"inputs": 512, "targets": 128}
+    check_for_metrics: If True, then only include datasets which have associated
+      metric functions.
+
+  Returns:
+    An input function for estimator.
+  """
+  def input_fn(params):
+    """Input function for estimator."""
+    del params
+
+    combined_ds = None
+    for dataset in datasets:
+      if not check_for_metrics or dataset.metric_fns:
+        ds = dataset.dataset_fn(sequence_length=sequence_length)
+        ds = ds.map(
+            _filter_features, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+        combined_ds = ds if not combined_ds else combined_ds.concatenate(ds)
+
+    combined_ds = combined_ds.batch(batch_size, drop_remainder=False)
+    # Pad the final batch.
+    combined_ds = transformer_dataset.trim_and_pad_dataset(
+        combined_ds, length=batch_size)
+    combined_ds = combined_ds.prefetch(tf.data.experimental.AUTOTUNE)
+    return combined_ds
+  return input_fn
 
 
 def get_step_from_checkpoint_path(checkpoint_path):
@@ -1233,13 +1511,96 @@ def decode_from_file(estimator,
     return dataset
 
   checkpoint_step = get_step_from_checkpoint_path(checkpoint_path)
-  decodes = decode(
-      estimator, input_fn, vocabulary, checkpoint_path=checkpoint_path)
+  decodes = list(decode(
+      estimator, input_fn, vocabulary, checkpoint_path=checkpoint_path))
   # Remove any padded examples
   dataset_size = len(inputs) * repeats
   decodes = decodes[:dataset_size]
   output_filename = "{}-{}".format(output_filename, checkpoint_step)
   write_lines_to_file(decodes, output_filename)
+
+
+@gin.configurable
+def decode_from_dataset(estimator,
+                        vocabulary,
+                        model_type,
+                        batch_size,
+                        sequence_length,
+                        checkpoint_path=None,
+                        infer_dataset_fn=gin.REQUIRED,
+                        dataset_split="validation",
+                        decode_output_dir=gin.REQUIRED):
+  """Decode using inputs from the Task examples and writes results to files.
+
+  Args:
+    estimator: a TPUEstimator
+    vocabulary: a mtf.transformer.vocabulary.Vocabulary
+    model_type: a string
+    batch_size: an integer
+    sequence_length: an integer or a dict from feature-key to integer
+      the (packed) sequence length, e.g. {"inputs": 512, "targets": 128}
+    checkpoint_path: Checkpoint to use for inference.
+    infer_dataset_fn: A function returning a list of dataset.EvalDataset tuples.
+      See `eval_dataset_fn` argument to `eval_model` for details.
+    dataset_split: str, which dataset split to load.
+    decode_output_dir: a string, where to write inputs, targets, and decodes.
+  """
+  if model_type != "lm":
+    raise ValueError("This function currently only supports decoder-only LMs.")
+
+  infer_datasets = infer_dataset_fn(
+      sequence_length=sequence_length,
+      vocabulary=vocabulary,
+      dataset_split=dataset_split,)
+
+  input_fn = _get_combined_dataset_input_fn(
+      infer_datasets, batch_size, sequence_length)
+
+  checkpoint_step = get_step_from_checkpoint_path(checkpoint_path)
+  # TODO(dei): Deal with case where decode() does not return the right number
+  # of outputs. This can happen if the generator in decode() has failures.
+  decodes = list(decode(
+      estimator, input_fn, vocabulary, checkpoint_path=checkpoint_path))
+
+  tf.logging.info("Caching inference examples.")
+  with tf.Graph().as_default():
+    for infer_dataset in infer_datasets:
+      ds = infer_dataset.dataset_fn()
+
+      # Create list of postprocessed text targets
+      examples_for_ds = list(tfds.as_numpy(ds))
+      examples_for_ds = _maybe_add_pretokenized_features(
+          examples_for_ds, vocabulary)
+
+      # Extract the portion of decodes corresponding to this dataset
+      dataset_size = len(examples_for_ds)
+      predictions = decodes[:dataset_size]
+
+      # Remove the used decodes.
+      del decodes[:dataset_size]
+
+      # Write the predictions to file.
+      predictions_filename = os.path.join(
+          decode_output_dir,
+          "{}_{}_predictions".format(infer_dataset.name, checkpoint_step),
+      )
+      write_lines_to_file(predictions, predictions_filename)
+
+      # Write the ground-truth targets to file.
+      targets = []
+      for ex in examples_for_ds:
+        targets_pretokenized = ex["targets_pretokenized"]
+        targets.append(infer_dataset.postprocess_fn(
+            targets_pretokenized, example=ex, is_target=True))
+      targets_filename = os.path.join(
+          decode_output_dir, "{}_targets".format(infer_dataset.name))
+      write_lines_to_file(targets, targets_filename)
+
+      # Write the inputs to a file.
+      inputs = [ex["inputs_pretokenized"] for ex in examples_for_ds]
+      inputs_filename = os.path.join(
+          decode_output_dir, "{}_inputs".format(infer_dataset.name))
+      write_lines_to_file(inputs, inputs_filename)
 
 
 @gin.configurable
@@ -1286,19 +1647,31 @@ def save_scores(results, vocabulary,
   scores = [r["scores"] for r in results]
 
   if scores_filename is not None:
-    write_lines_to_file(["%f" % f for f in scores], scores_filename+".scores")
+    write_lines_to_file(["%g" % f for f in scores], scores_filename+".scores")
 
   if save_example_text:
+    results = _maybe_add_pretokenized_features(results, vocabulary)
+
     # Targets will always exist.
     targets = [r.get("targets_pretokenized", r["targets"]) for r in results]
-    targets = _maybe_decode_python(targets, targets_vocabulary(vocabulary))
     if scores_filename is not None:
       write_lines_to_file(targets, scores_filename+".targets")
+
+    # Write sequence lengths
+    def get_sequence_length(tokens, pad_id=0):
+      tokens = np.array(tokens)
+      if not np.isin(pad_id, tokens):
+        return len(tokens)
+      # Argmax returns the index of the first occurrence of pad_id.
+      return np.argmax(tokens == pad_id)
+
+    seq_lengths = [get_sequence_length(r["targets"]) for r in results]
+    if scores_filename is not None:
+      write_lines_to_file(seq_lengths, scores_filename+".lengths")
 
     # Inputs may only exist for some tasks.
     if "inputs" in results[0]:
       inputs = [r.get("inputs_pretokenized", r["inputs"]) for r in results]
-      inputs = _maybe_decode_python(inputs, inputs_vocabulary(vocabulary))
       if scores_filename is not None:
         write_lines_to_file(inputs, scores_filename+".inputs")
       return scores, inputs, targets
@@ -1308,6 +1681,54 @@ def save_scores(results, vocabulary,
   return scores
 
 
+@gin.configurable
+def save_scores_to_tfrecords(
+    results, vocabulary, scores_filename, shard_idx=0, save_ids_only=False):
+  """Processes results from scoring examples and saves them to tfrecords files.
+
+  Args:
+    results: list of dictionaries containing the results for each scored
+        example.
+    vocabulary: a function that that returns a tf.data.Dataset with examples
+      containing the string field 'targets' and optionally the field 'inputs'
+    scores_filename: a string (path of file to write scores to).
+    shard_idx: an integer indicating the current index of the file for sharding.
+    save_ids_only: if true, save the ID that is prepended to the inputs,
+      delimited by a space.
+  """
+  results = _maybe_add_pretokenized_features(results, vocabulary)
+  scores = [r.get("scores", 0.0) for r in results]
+  targets = [r.get("targets_pretokenized", r["targets"]) for r in results]
+  inputs = [r.get("targets_neg_pretokenized",
+                  r.get("inputs", "")) for r in results]
+
+  if save_ids_only:
+    inputs = [r.split(" ", 1)[0] for r in inputs]
+
+  table_path = "{}_{}.tfrecord".format(scores_filename, shard_idx)
+  tf.logging.info("Saving results to %s", table_path)
+
+  with tf.io.TFRecordWriter(table_path) as file_writer:
+    for input_, target, score in zip(inputs, targets, scores):
+      record_bytes = tf.train.Example(
+          features=tf.train.Features(
+              feature={
+                  "input":
+                      tf.train.Feature(
+                          bytes_list=tf.train.BytesList(
+                              value=[bytes(input_, "utf8")])),
+                  "target":
+                      tf.train.Feature(
+                          bytes_list=tf.train.BytesList(
+                              value=[bytes(target, "utf8")])),
+                  "score":
+                      tf.train.Feature(
+                          float_list=tf.train.FloatList(value=[score])),
+              })).SerializeToString()
+      file_writer.write(record_bytes)
+
+
+@gin.configurable
 def score_with_estimator(estimator, input_fn, eval_checkpoint_step, model_dir,
                          vocabulary, score_postprocess_fn=save_scores,
                          num_examples=None):
@@ -1345,14 +1766,113 @@ def score_with_estimator(estimator, input_fn, eval_checkpoint_step, model_dir,
   return score_postprocess_fn(results, vocabulary)
 
 
-def _maybe_decode_python(ids_or_strs, vocabulary):
-  """Decode if ids_or_strs is not yet strings in pure python."""
+@gin.configurable
+def score_with_estimator_lazy(
+    estimator, input_fn, eval_checkpoint_step, model_dir,
+    vocabulary, score_postprocess_fn=save_scores_to_tfrecords,
+    num_examples=None, num_examples_per_shard=100000):
+  """Score each example returned by input_fn lazily.
 
-  if ids_or_strs:
-    if isinstance(ids_or_strs[0], np.ndarray) and np.issubdtype(
-        ids_or_strs[0].dtype, np.integer):
-      ids_or_strs = [vocabulary.decode(t.tolist()) for t in ids_or_strs]
-  return ids_or_strs
+  Args:
+    estimator: a TPUEstimator
+    input_fn: a function that that returns a tf.data.Dataset with examples
+      containing the string field 'targets' and optionally the field 'inputs'
+    eval_checkpoint_step: int, list of ints, or None, see `eval_model`
+      docstring.
+    model_dir: string, estimator model_dir
+    vocabulary: a vocabulary.Vocabulary or (inputs_vocabulary,
+      targets_vocabulary) tuple
+    score_postprocess_fn: a function that takes in model outputs
+      post-processes, and saves them.
+    num_examples: int, the total # of examples being scored, None if unknown
+    num_examples_per_shard: int, the number of examples per file shard.
+
+  Returns:
+    a list of floats
+  """
+  if num_examples is not None:
+    num_shards = math.ceil(num_examples / num_examples_per_shard)
+  else:
+    num_shards = None
+  tf.logging.info("Scoring %s examples with %s shards at %s examples per shard",
+                  num_examples, num_shards, num_examples_per_shard)
+
+  checkpoint_path, = get_checkpoint_iterator(eval_checkpoint_step, model_dir)
+  result_iter = estimator.predict(input_fn, checkpoint_path=checkpoint_path)
+
+  start = time.time()
+  results = []
+  shard_idx = 0
+
+  for i, result in enumerate(result_iter):
+    results.append(result)
+    num_results = len(results)
+    exceeded_examples_per_shard = (
+        num_examples_per_shard is not None
+        and num_examples_per_shard > 0
+        and num_results >= num_examples_per_shard)
+    exceeded_num_examples = num_examples is not None and i >= num_examples
+
+    if exceeded_examples_per_shard or exceeded_num_examples:
+      score_postprocess_fn(results, vocabulary, shard_idx=shard_idx)
+
+      elapsed = time.time() - start
+      tf.logging.info("Scored %s results in %s s, %s examples/s for shard %s",
+                      num_results, elapsed, num_results / elapsed, shard_idx)
+
+      results = []
+      shard_idx += 1
+      start = time.time()
+
+    if exceeded_num_examples:
+      break
+
+  if results:
+    score_postprocess_fn(results, vocabulary, shard_idx=shard_idx)
+
+
+def _maybe_add_pretokenized_features(examples, vocabulary):
+  """Ensures decoded versions of "inputs" and "targets" exist in each example.
+
+  Args:
+    examples: List of example dictionaries containing mappings from feature
+      name to np.array of integers.
+    vocabulary: The vocabulary.
+
+  Returns:
+    examples dictionary with decoded plaintext entries for each feature in
+    features that was present in the original example.
+  """
+  vocabulary = {"inputs": inputs_vocabulary(vocabulary),
+                "targets": targets_vocabulary(vocabulary)}
+
+  # This is just used for logging purposes.
+  added_pretokenized = {"inputs": False, "targets": False}
+
+  for example in examples:
+    for feature_name in ["inputs", "targets"]:
+      pretokenized_feature_name = feature_name + "_pretokenized"
+      neg_pretokenized_feature_name = feature_name + "_neg_pretokenized"
+      if feature_name in example and pretokenized_feature_name not in example:
+        ids = example[feature_name].tolist()
+
+        neg_ids = [abs(i) for i in ids if i < 0]
+        ids = [i for i in ids if i > 0]
+
+        decoded_string = vocabulary[feature_name].decode(ids)
+        example[pretokenized_feature_name] = decoded_string
+
+        if neg_ids:
+          neg_decoded_string = vocabulary[feature_name].decode(neg_ids)
+          example[neg_pretokenized_feature_name] = neg_decoded_string
+
+        if not added_pretokenized[feature_name]:
+          added_pretokenized[feature_name] = True
+          tf.logging.warning(
+              "Feature '%s' is being approximated by decoding from the "
+              "tokenized feature '%s.'",
+              pretokenized_feature_name, feature_name)
+  return examples
 
 
 @gin.configurable
@@ -1360,7 +1880,8 @@ def score_from_strings(estimator, vocabulary, model_type, batch_size,
                        sequence_length, model_dir, eval_checkpoint_step,
                        inputs=gin.REQUIRED, targets=gin.REQUIRED,
                        score_postprocess_fn=gin.REQUIRED, eos_id=1,
-                       score_eos=True):
+                       score_eos=True,
+                       score_with_estimator_fn=score_with_estimator):
   """Compute log likelihoods per example and write to a text file.
 
   inputs & targets must either be the same length (in lines) or have inputs
@@ -1391,6 +1912,7 @@ def score_from_strings(estimator, vocabulary, model_type, batch_size,
     score_eos: a boolean - whether to score the final eos token of each line
       If this is set to false, the scores can be interpreted as prefix
       log-likelihoods
+    score_with_estimator_fn: a function to run scoring with the estimator.
   Returns:
     a list of floats
   """
@@ -1436,7 +1958,7 @@ def score_from_strings(estimator, vocabulary, model_type, batch_size,
     dataset = dataset.batch(batch_size, drop_remainder=True)
     return dataset.prefetch(tf.data.experimental.AUTOTUNE)
 
-  return score_with_estimator(
+  return score_with_estimator_fn(
       estimator, input_fn, eval_checkpoint_step, model_dir,
       vocabulary, score_postprocess_fn, len(targets))
 
@@ -1445,7 +1967,8 @@ def score_from_strings(estimator, vocabulary, model_type, batch_size,
 def score_from_dataset(estimator, vocabulary, batch_size, sequence_length,
                        model_dir, eval_checkpoint_step, dataset_split,
                        score_dataset_fn=None,
-                       score_postprocess_fn=gin.REQUIRED):
+                       score_postprocess_fn=gin.REQUIRED,
+                       score_with_estimator_fn=score_with_estimator):
   """Compute log likelihoods per example and write to a text file.
 
   The function returns a list of floats representing the log-likelihood of the
@@ -1467,6 +1990,7 @@ def score_from_dataset(estimator, vocabulary, batch_size, sequence_length,
       See `eval_dataset_fn` argument to `eval_model` for details.
     score_postprocess_fn: Function that takes in model outputs and
       post-processes then returns then.
+    score_with_estimator_fn: a function to run scoring with the estimator.
 
   Returns:
     scores: a list of floats, the log likelihood scores
@@ -1477,27 +2001,12 @@ def score_from_dataset(estimator, vocabulary, batch_size, sequence_length,
       vocabulary=vocabulary,
       dataset_split=dataset_split)
 
-  def input_fn(params):
-    """Eval input function for estimator."""
-    del params
+  input_fn = _get_combined_dataset_input_fn(
+      scoring_datasets, batch_size, sequence_length)
 
-    dataset = None
-    for scoring_dataset in scoring_datasets:
-      ds = scoring_dataset.dataset_fn()
-      ds = ds.map(
-          _filter_features, num_parallel_calls=tf.data.experimental.AUTOTUNE)
-      dataset = dataset.concatenate(ds) if dataset else ds
-
-    dataset = dataset.batch(batch_size, drop_remainder=False)
-    # Pad the final batch.
-    dataset = transformer_dataset.trim_and_pad_dataset(
-        dataset, length=batch_size)
-    dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
-    return dataset
-
-  return score_with_estimator(
+  return score_with_estimator_fn(
       estimator, input_fn, eval_checkpoint_step, model_dir,
-      vocabulary, score_postprocess_fn, None)
+      vocabulary, score_postprocess_fn)
 
 
 def get_estimator(model_type, vocabulary, mesh_shape,
@@ -1572,9 +2081,7 @@ def get_estimator(model_type, vocabulary, mesh_shape,
       model_dir=model_dir,
       tpu_config=my_tpu_config,
       session_config=session_config,
-      # We use a saver hook, so disable checkpoints here to prevent double
-      # saving.
-      save_checkpoints_steps=None,
+      save_checkpoints_steps=save_checkpoints_steps,
       save_checkpoints_secs=None)
 
   transformer_model = build_model(
@@ -1619,11 +2126,10 @@ def get_estimator(model_type, vocabulary, mesh_shape,
   return estimator
 
 
-@gin.configurable
 def train_model(estimator, vocabulary, sequence_length, batch_size,
                 train_dataset_fn, train_steps, ensemble_inputs,
                 dataset_split="train", skip_seen_data=False,
-                seen_data_init_step=0):
+                seen_data_init_step=0, checkpoint_input_pipeline=False):
   """Train a Mesh-TF model.
 
   Args:
@@ -1648,10 +2154,19 @@ def train_model(estimator, vocabulary, sequence_length, batch_size,
     skip_seen_data: a boolean, is `False` by default. Used when a training run
       restarts to skip already seen data. This flag is only consistent when
       every setting (such as batch size and random seed) on the model is the
-      same between the original run and the new run.
+      same between the original run and the new run. May require a significant
+      amount of time to skip a large number of steps.
     seen_data_init_step: an integer, when `skip_seen_data` is True, skip seen
       steps from this starting point. Useful when finetuning.
+    checkpoint_input_pipeline: a boolean, whether to checkpoint the input
+      pipeline in order to restart from the previous run. May require a large
+      amount of disk space for complicated input pipelines.
   """
+
+  if skip_seen_data and checkpoint_input_pipeline:
+    raise ValueError(
+        "At most one of `skip_seen_data` and `checkpoint_input_pipeline` may "
+        "be set.")
 
   def input_fn(params):
     del params
@@ -1674,7 +2189,11 @@ def train_model(estimator, vocabulary, sequence_length, batch_size,
         dataset = dataset.skip(steps_to_skip)
     return dataset
 
-  estimator.train(input_fn=input_fn, max_steps=train_steps)
+  hooks = []
+  if checkpoint_input_pipeline:
+    hooks.append(tf.data.experimental.CheckpointInputPipelineHook(estimator))
+
+  estimator.train(input_fn=input_fn, max_steps=train_steps, hooks=hooks)
 
 
 @gin.configurable
@@ -1685,10 +2204,8 @@ def infer_model(estimator,
                 model_type,
                 model_dir,
                 eval_checkpoint_step,
-                input_filename=None,
-                output_filename=None,
                 checkpoint_paths=None,
-                decode_from_file_fn=decode_from_file):
+                decode_fn=decode_from_file):
   """Infer a Mesh-TF model.
 
   Args:
@@ -1703,24 +2220,20 @@ def infer_model(estimator,
     model_dir: string, estimator model_dir
     eval_checkpoint_step: int, list of ints, or None, see `eval_model`
       docstring.
-    input_filename: a string, input file with examples
-    output_filename: a string, output file to save decodes
     checkpoint_paths: optional list of checkpoints to run inference for
-    decode_from_file_fn: decoding function, defaults to decode_from_file
+    decode_fn: decoding function, defaults to decode_from_file
   """
   if checkpoint_paths is None:
     checkpoint_paths = get_checkpoint_iterator(eval_checkpoint_step, model_dir)
 
   for checkpoint_path in checkpoint_paths:
-    decode_from_file_fn(
+    decode_fn(
         estimator,
         vocabulary=vocabulary,
         model_type=model_type,
         batch_size=batch_size,
         sequence_length=sequence_length,
-        checkpoint_path=checkpoint_path,
-        input_filename=input_filename,
-        output_filename=output_filename)
+        checkpoint_path=checkpoint_path)
 
 
 def eval_model(estimator,
@@ -1733,7 +2246,9 @@ def eval_model(estimator,
                eval_summary_dir,
                eval_checkpoint_step,
                eval_with_score=False,
-               output_eval_examples=True):
+               output_eval_examples=True,
+               eval_dir_suffix=None,
+               score_with_estimator_fn=score_with_estimator):
   """Eval a Mesh-TF model.
 
   Args:
@@ -1775,6 +2290,9 @@ def eval_model(estimator,
       targets instead of decoded predictions.
     output_eval_examples: bool, whether to dump inputs, targets and predictions
       of the eval examples in plaintext to eval_summary_dir.
+    eval_dir_suffix: string, if not None then will appended to the
+      eval_summary_dir.
+    score_with_estimator_fn: a function to run scoring with the estimator.
   """
   if eval_dataset_fn is None:
     raise ValueError("Must provide eval_dataset_fn through gin for eval.")
@@ -1806,6 +2324,8 @@ def eval_model(estimator,
 
   eval_summary_dir = eval_summary_dir or os.path.join(
       model_dir, "{}_eval".format(dataset_split))
+  if eval_dir_suffix is not None:
+    eval_summary_dir += "_{}".format(eval_dir_suffix)
   summary_writer = tf.summary.FileWriter(eval_summary_dir)
 
   # Pre-load in all of the targets once before entering continuous eval loop
@@ -1876,31 +2396,15 @@ def eval_model(estimator,
   if callable(estimator):
     estimator = estimator()
 
-  def input_fn(params):
-    """Eval input function for estimator."""
-    del params
-    # Concatenate all dataset inputs to only have to do one decode loop
-    combined_ds = None
-    for eval_dataset in eval_datasets:
-      # Only evaluate tasks with metrics.
-      if eval_dataset.metric_fns:
-        ds = eval_dataset.dataset_fn(sequence_length=sequence_length)
-        ds = ds.map(
-            _filter_features, num_parallel_calls=tf.data.experimental.AUTOTUNE)
-        combined_ds = ds if not combined_ds else combined_ds.concatenate(ds)
-    combined_ds = combined_ds.batch(batch_size, drop_remainder=False)
-    # Pad the final batch.
-    combined_ds = transformer_dataset.trim_and_pad_dataset(
-        combined_ds, length=batch_size)
-    combined_ds = combined_ds.prefetch(tf.data.experimental.AUTOTUNE)
-    return combined_ds
+  input_fn = _get_combined_dataset_input_fn(
+      eval_datasets, batch_size, sequence_length, check_for_metrics=True)
 
   checkpoint_paths = get_checkpoint_iterator(eval_checkpoint_step, model_dir)
   for checkpoint_path in checkpoint_paths:
-    tf.logging.info("Checkpoint path %s" % checkpoint_path)
+    tf.logging.info("Checkpoint path %s", checkpoint_path)
     global_step = int(get_step_from_checkpoint_path(checkpoint_path))
     if eval_with_score:
-      outputs, _ = score_with_estimator(
+      outputs, _ = score_with_estimator_fn(
           estimator, input_fn, global_step, model_dir, vocabulary,
           num_examples=sum(len(cex) for cex in cached_examples.values()))
     else:
@@ -1932,10 +2436,15 @@ def eval_model(estimator,
         summary = tf.Summary()
         targets = cached_targets[eval_dataset.name]
         metric_result = metric_fn(targets, predictions)
-        for metric_name, metric_value in metric_result.items():
-          tag = "eval/{}/{}".format(eval_dataset.name, metric_name)
-          tf.logging.info("%s at step %d: %.3f", tag, global_step, metric_value)
-          summary.value.add(tag=tag, simple_value=metric_value)
+        if isinstance(metric_result, tf.Summary):
+          tf.logging.info("Precomputed summary at step %d", global_step)
+          summary_writer.add_summary(metric_result, global_step)
+        else:
+          for metric_name, metric_value in metric_result.items():
+            tag = "eval/{}/{}".format(eval_dataset.name, metric_name)
+            tf.logging.info("%s at step %d: %.3f", tag, global_step,
+                            metric_value)
+            summary.value.add(tag=tag, simple_value=metric_value)
           summary_writer.add_summary(summary, global_step)
       summary_writer.flush()
 
@@ -2004,9 +2513,18 @@ def export_model(estimator, export_dir, vocabulary, sequence_length,
       targets = str_placeholder("targets")
 
       predict_batch_size = tf.shape(inputs)[0]
-      dataset = tf.data.Dataset.from_tensor_slices(
-          {"inputs": inputs, "targets": targets})
-      dataset = transformer_dataset.encode_all_features(dataset, vocabulary)
+
+      inputs_dataset = transformer_dataset.encode_all_features(
+          tf.data.Dataset.from_tensor_slices({"inputs": inputs}),
+          inputs_vocabulary(vocabulary))
+
+      targets_dataset = transformer_dataset.encode_all_features(
+          tf.data.Dataset.from_tensor_slices({"targets": targets}),
+          targets_vocabulary(vocabulary))
+
+      dataset = tf.data.Dataset.zip((inputs_dataset, targets_dataset))
+      dataset = dataset.map(lambda x, y: {**x, **y},
+                            num_parallel_calls=tf.data.experimental.AUTOTUNE)
 
       receiver_tensors = {"inputs": inputs, "targets": targets}
 
@@ -2025,7 +2543,7 @@ def export_model(estimator, export_dir, vocabulary, sequence_length,
 
     features = tf.data.experimental.get_single_element(dataset)
     features["predict_batch_size"] = predict_batch_size
-    return tf.estimator.export.ServingInputReceiver(
+    return tf_estimator.export.ServingInputReceiver(
         features=features, receiver_tensors=receiver_tensors)
 
   return estimator.export_saved_model(
@@ -2168,15 +2686,17 @@ def auto_train_steps(batch_size,
 
 @gin.configurable
 def get_checkpoint_iterator(checkpoint_step, model_dir, skip_until=0,
-                            stop_after=None):
+                            stop_after=None, find_closest=True):
   """Get an iterable of checkpoint paths from a provided checkpoint step(s).
 
   Args:
-    checkpoint_step: If checkpoint_step is an int, find the checkpoint with the
-      closest global step and return a singleton list. If checkpoint_step is a
-      list of ints, replace each int with the path to the checkpoint with the
-      closest global step. If checkpoint_step == "all", return the path of every
-      checkpoint in model_dir, starting from the earliest checkpoint. If
+    checkpoint_step: If checkpoint_step is an int, return a singleton list with
+      that checkpoint path in it. If find_closest, the checkpoint with the
+      closest global step will be reurned. If checkpoint_step is a
+      list of ints, replace each int with its corresponding path (if
+      find_closest, the path with the closest global step). If
+      checkpoint_step == "all", return the path of every checkpoint in
+      model_dir, starting from the earliest checkpoint. If
       checkpoint_step == -1, return the latest checkpoint as specified in
       model_dir/checkpoint. If checkpoint_step is None, return
       `tf.train.checkpoints_iterator` for `model_dir`.
@@ -2186,6 +2706,9 @@ def get_checkpoint_iterator(checkpoint_step, model_dir, skip_until=0,
     stop_after: an optional integer - for "None behavior, if specified
       stop after finding a checkpoint number that is >= stop_at. When a
       checkpoint number == stop_at is found, it is yielded before exiting.
+    find_closest: If True and a specified checkpoint step does not exist, will
+      choose the nearest checkpoint to that step. If False, then will
+      only look for a checkpoint matching the exact specified step.
 
   Returns:
     An iterable which yields checkpoint paths.
@@ -2216,6 +2739,10 @@ def get_checkpoint_iterator(checkpoint_step, model_dir, skip_until=0,
   def _get_checkpoint_path(step):
     return os.path.join(model_dir, "model.ckpt-{}".format(step))
 
+  def _get_checkpoint_path_if_exists(step):
+    path = _get_checkpoint_path(step)
+    return path if tf.train.checkpoint_exists(path) else None
+
   def _filter_fn(p):
     return get_step_from_checkpoint_path(p) > skip_until
 
@@ -2241,11 +2768,22 @@ def get_checkpoint_iterator(checkpoint_step, model_dir, skip_until=0,
       return _generate_checkpoints()
     else:
       return checkpoints_iterator
-  elif isinstance(checkpoint_step, int):
-    return [_get_checkpoint_path(_get_closest_checkpoint(checkpoint_step))]
+  elif find_closest:
+    if isinstance(checkpoint_step, int):
+      return [_get_checkpoint_path(_get_closest_checkpoint(checkpoint_step))]
+    else:
+      closests = np.unique(
+          [_get_closest_checkpoint(c) for c in checkpoint_step])
+      return [_get_checkpoint_path(closest) for closest in closests]
   else:
-    closests = np.unique([_get_closest_checkpoint(c) for c in checkpoint_step])
-    return [_get_checkpoint_path(closest) for closest in closests]
+    if isinstance(checkpoint_step, int):
+      checkpoint_step = [checkpoint_step]
+    checkpoints = [_get_checkpoint_path_if_exists(c) for c in checkpoint_step]
+    checkpoints = [c for c in checkpoints if c]
+    if not checkpoints:
+      raise ValueError("You asked for checkpoints '%s' but none were found." %
+                       str(checkpoint_step))
+    return checkpoints
 
 
 # TODO(noam): provide a more informative string for layout_rules:
@@ -2286,7 +2824,10 @@ def run(tpu_job_name,
         ensemble_inputs=None,
         train_model_fn=train_model,
         skip_seen_data=False,
-        output_eval_examples=True):
+        seen_data_init_step=0,
+        output_eval_examples=True,
+        checkpoint_input_pipeline=False,
+        eval_dir_suffix=None):
   """Run training, eval, or inference depending on `mode`.
 
   Args:
@@ -2352,10 +2893,19 @@ def run(tpu_job_name,
     skip_seen_data: a boolean, is `False` by default. Used when a training run
       restarts to skip already seen data. This flag is only consistent when
       every setting (such as batch size and random seed) on the model is the
-      same between the original run and the new run.
+      same between the original run and the new run. May require a significant
+      amount of time to skip a large number of steps.
+    seen_data_init_step: an integer, when `skip_seen_data` is True, skip seen
+      steps from this starting point. Useful when finetuning.
     output_eval_examples: a boolean, is `True` by default. Used to decide
       whether to output whether to dump inputs, targets, and predictions of the
       eval examples in plaintext to eval_summary_dir.
+    checkpoint_input_pipeline: a boolean, whether to checkpoint the input
+      pipeline in order to restart from the previous run. May require a large
+      amount of disk space for complicated input pipelines.
+    eval_dir_suffix: a string, if not None then will be appended to the eval
+      subdirectory name for all three eval modes:
+      `perplexity_eval`, `eval`, `score_eval`.
   """
   if isinstance(sequence_length, int):
     sequence_length = {"inputs": sequence_length,
@@ -2379,15 +2929,15 @@ def run(tpu_job_name,
     learning_rate_schedule = functools.partial(
         learning_rate_schedule, total_train_steps=total_run_steps)
 
-  tf.logging.info("model_type=%s" % model_type,)
-  tf.logging.info("mode=%s" % mode,)
-  tf.logging.info("sequence_length=%s" % sequence_length,)
-  tf.logging.info("batch_size=%s" % batch_size,)
-  tf.logging.info("train_steps=%s" % train_steps,)
+  tf.logging.info("model_type=%s", model_type,)
+  tf.logging.info("mode=%s", mode,)
+  tf.logging.info("sequence_length=%s", sequence_length,)
+  tf.logging.info("batch_size=%s", batch_size,)
+  tf.logging.info("train_steps=%s", train_steps,)
   if total_run_steps is not None:
-    tf.logging.info("total_run_steps=%s" % total_run_steps,)
-  tf.logging.info("mesh_shape=%s" % mesh_shape,)
-  tf.logging.info("layout_rules=%s" % layout_rules,)
+    tf.logging.info("total_run_steps=%s", total_run_steps,)
+  tf.logging.info("mesh_shape=%s", mesh_shape,)
+  tf.logging.info("layout_rules=%s", layout_rules,)
 
   if mode == "train" and dataset_split != "train":
     raise ValueError("mode==\"train\" requires dataset_split==\"train\"")
@@ -2401,9 +2951,7 @@ def run(tpu_job_name,
   cluster = tf.distribute.cluster_resolver.TPUClusterResolver(
       tpu, zone=tpu_zone, project=gcp_project) if tpu else None
 
-  tf.logging.info(
-      "Building TPUConfig with tpu_job_name={}".format(tpu_job_name)
-  )
+  tf.logging.info("Building TPUConfig with tpu_job_name=%s", tpu_job_name)
 
   score_in_predict_mode = "score" in mode
   estimator_fn = functools.partial(
@@ -2444,7 +2992,9 @@ def run(tpu_job_name,
 
     train_model_fn(estimator, vocabulary, sequence_length, batch_size,
                    train_dataset_fn, train_steps, ensemble_inputs,
-                   skip_seen_data=skip_seen_data)
+                   skip_seen_data=skip_seen_data,
+                   seen_data_init_step=seen_data_init_step,
+                   checkpoint_input_pipeline=checkpoint_input_pipeline)
 
   elif mode == "perplexity_eval":
     if eval_dataset_fn is None:
@@ -2485,6 +3035,8 @@ def run(tpu_job_name,
         # include the number of examples in the evaluation name so as to
         # make sure we are comparing apples to apples.
         name = "%s_%s_%d" % (eval_dataset.name, dataset_split, num_examples)
+        if eval_dir_suffix is not None:
+          name += "_%s" % eval_dir_suffix
         _ = estimator.evaluate(
             input_fn=functools.partial(_input_fn, eval_dataset=eval_dataset),
             steps=perplexity_eval_steps,
@@ -2502,7 +3054,8 @@ def run(tpu_job_name,
         eval_summary_dir,
         eval_checkpoint_step,
         eval_with_score=(mode == "score_eval"),
-        output_eval_examples=output_eval_examples)
+        output_eval_examples=output_eval_examples,
+        eval_dir_suffix=eval_dir_suffix)
   elif mode == "infer":
     infer_model(estimator, vocabulary, sequence_length, batch_size, model_type,
                 model_dir, eval_checkpoint_step)

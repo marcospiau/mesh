@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The Mesh TensorFlow Authors.
+# Copyright 2022 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import gin
 import mesh_tensorflow as mtf
 from mesh_tensorflow.transformer import transformer
 import tensorflow.compat.v1 as tf
+from tensorflow.compat.v1 import estimator as tf_estimator
 
 
 @gin.configurable
@@ -254,7 +255,7 @@ class BitransformerFunnel(transformer.Bitransformer):
                   inputs,
                   targets,
                   compute_loss,
-                  mode=tf.estimator.ModeKeys.TRAIN,
+                  mode=tf_estimator.ModeKeys.TRAIN,
                   variable_dtype=mtf.VariableDType(tf.float32),
                   encoder_sequence_id=None,
                   decoder_sequence_id=None,
@@ -373,7 +374,7 @@ class BitransformerFunnel(transformer.Bitransformer):
         inputs=inputs,
         targets=None,
         compute_loss=False,
-        mode=tf.estimator.ModeKeys.PREDICT,
+        mode=tf_estimator.ModeKeys.PREDICT,
         variable_dtype=variable_dtype,
         sequence_id=encoder_sequence_id,
         shared_params=shared_params,

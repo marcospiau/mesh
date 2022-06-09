@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The Mesh TensorFlow Authors.
+# Copyright 2022 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Lint as: python3
 """Custom layers for the evolved transformer.
 
 See https://arxiv.org/abs/1901.11117 for more details.
@@ -230,7 +229,7 @@ def _pad_channels_dim(tensor, size):
 def _dropout(x, context, dropout_rate):
   if context.train and dropout_rate > 0:
     return mtf.dropout(
-        x,
+        x, context.train,
         rate=dropout_rate,
         noise_shape=mtf.Shape(context.batch_dims + x.shape.dims[-1:]))
   else:

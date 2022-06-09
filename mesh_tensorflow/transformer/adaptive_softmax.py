@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The Mesh TensorFlow Authors.
+# Copyright 2022 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Lint as: python3
 """Implementation of adaptive softmax.
 
 See the papers https://arxiv.org/abs/1609.04309 and
@@ -29,6 +28,7 @@ from mesh_tensorflow.transformer import transformer
 from mesh_tensorflow.transformer import vocab_embeddings
 
 import tensorflow.compat.v1 as tf
+from tensorflow.compat.v1 import estimator as tf_estimator
 
 
 class _Cluster(object):
@@ -330,7 +330,7 @@ class AdaptiveSoftmaxVocabEmbedding(object):
     Returns:
       an mtf.Tensor
     """
-    if context.mode == tf.estimator.ModeKeys.TRAIN:
+    if context.mode == tf_estimator.ModeKeys.TRAIN:
       return hidden
     else:
       return self._hidden_to_logits(hidden, context)

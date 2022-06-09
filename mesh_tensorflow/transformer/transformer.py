@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The Mesh TensorFlow Authors.
+# Copyright 2022 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -45,11 +45,13 @@ from __future__ import print_function
 
 import json
 import math
+import re
 
 import gin
 import mesh_tensorflow as mtf
 
 import tensorflow.compat.v1 as tf
+from tensorflow.compat.v1 import estimator as tf_estimator
 
 
 class TransformerLayer(object):
@@ -124,7 +126,7 @@ class Context(object):
                length_dim,
                variable_dtype,
                beam_dim=None,
-               mode=tf.estimator.ModeKeys.TRAIN,
+               mode=tf_estimator.ModeKeys.TRAIN,
                position=None,
                position_is_default=False,
                sequence_id=None,
@@ -233,10 +235,11 @@ class Context(object):
     self.inputs = inputs
     self.encoder_inputs = encoder_inputs
     self.num_microbatches = num_microbatches
+    self.input_embeddings = None
 
   @property
   def train(self):
-    return self.mode == tf.estimator.ModeKeys.TRAIN
+    return self.mode == tf_estimator.ModeKeys.TRAIN
 
   @property
   def activation_dtype(self):
@@ -549,6 +552,36 @@ def sublayer_rms_norm_subsampled(x, layer_stack, context, percentage=100.,
 
 
 @gin.configurable
+def sublayer_scale_norm(x,
+                        layer_stack,
+                        context,
+                        epsilon=1e-6,
+                        name="scale_norm"):
+  """Scale normalization.
+
+  Args:
+    x: an input mtf.Tensor
+    layer_stack: a LayerStack
+    context: a Context
+    epsilon: a float
+    name: a string
+  Returns:
+    a mtf.Tensor
+  """
+  del layer_stack
+  model_dim = context.model.model_dim
+  with tf.variable_scope(name):
+    scale = mtf.get_variable(
+        context.mesh,
+        "scale",
+        context.model.ensemble_dims,
+        initializer=tf.ones_initializer(),
+        dtype=context.variable_dtype)
+    variance = mtf.reduce_mean(mtf.square(x), reduced_dim=model_dim)
+  return x * mtf.rsqrt(variance + epsilon) * scale
+
+
+@gin.configurable
 def sublayer_residual(x, layer_stack, context):
   del layer_stack
   return x + context.current_layer_input
@@ -559,10 +592,43 @@ def sublayer_dropout(x, layer_stack, context, dropout_rate=0.0):
   del layer_stack
   if context.train and dropout_rate > 0:
     return mtf.dropout(
-        x, rate=dropout_rate,
+        x, context.train, rate=dropout_rate,
         noise_shape=mtf.Shape(context.batch_dims + [context.model.model_dim]))
   else:
     return x
+
+
+@gin.configurable
+def sublayer_annealed_dropout(x,
+                              layer_stack,
+                              context,
+                              init_dropout_rate=0.0,
+                              start_step=None,
+                              end_step=None):
+  """Transformer sublayer which linearly anneals the dropout rate."""
+  if start_step is None:
+    raise ValueError("The start step for dropout annealing required.")
+  if end_step is None:
+    raise ValueError("The end step for dropout annealing required.")
+
+  del layer_stack
+  if context.train and init_dropout_rate > 0:
+    return mtf.layers.annealed_dropout(
+        x,
+        context.train,
+        start_step,
+        end_step,
+        init_rate=init_dropout_rate,
+        noise_shape=mtf.Shape(context.batch_dims + [context.model.model_dim]))
+  else:
+    return x
+
+
+@gin.configurable
+def sublayer_clip_activation_gradient(x, layer_stack, context, rms_norm=1.0):
+  """Clip activation gradient by RMS-norm."""
+  del layer_stack, context
+  return mtf.layers.clip_activation_gradient(x, rms_norm)
 
 
 @gin.configurable
@@ -816,9 +882,9 @@ class Unitransformer(object):
           context.variable_dtype,
           name="embedding",
           ensemble_dim=self.ensemble_dim)
-    if context.train:
-      inputs = mtf.dropout(inputs, rate=self.token_dropout_rate)
+    inputs = mtf.dropout(inputs, context.train, rate=self.token_dropout_rate)
     x = vocab_embedding.ids_to_embedding(inputs, context)
+    context.input_embeddings = x
     if self.positional_embedding or self.sinusoid_positional_embedding:
       if self.sinusoid_positional_embedding:
         pos_emb_var = sinusoid_positional_embedding_weights(
@@ -901,7 +967,7 @@ class Unitransformer(object):
                   inputs,
                   targets,
                   compute_loss,
-                  mode=tf.estimator.ModeKeys.TRAIN,
+                  mode=tf_estimator.ModeKeys.TRAIN,
                   variable_dtype=mtf.VariableDType(tf.float32),
                   sequence_id=None,
                   subsequence_id=None,
@@ -1462,7 +1528,7 @@ class Bitransformer(object):
                   inputs,
                   targets,
                   compute_loss,
-                  mode=tf.estimator.ModeKeys.TRAIN,
+                  mode=tf_estimator.ModeKeys.TRAIN,
                   variable_dtype=mtf.VariableDType(tf.float32),
                   encoder_sequence_id=None,
                   decoder_sequence_id=None,
@@ -1576,7 +1642,7 @@ class Bitransformer(object):
         inputs=inputs,
         targets=None,
         compute_loss=False,
-        mode=tf.estimator.ModeKeys.PREDICT,
+        mode=tf_estimator.ModeKeys.PREDICT,
         variable_dtype=variable_dtype,
         sequence_id=encoder_sequence_id,
         shared_params=shared_params,
@@ -1644,6 +1710,7 @@ class StudentTeacher(object):
                teacher,
                temperature=None,
                fraction_soft=None,
+               distill_start_step=0,
                teacher_checkpoint=None,
                initialize_student_weights=False):
     """Create a StudentTeacher.
@@ -1657,6 +1724,8 @@ class StudentTeacher(object):
         target cross entropy to the training loss. The rest of the loss will be
         the cross entropy with the one-hot actual label. Required only when
         training.
+      distill_start_step: an int, training steps after which teacher loss is
+        incorporated in the overall loss.
       teacher_checkpoint: a string, the path to the teacher checkpoint that we
         wish to use. Required only when training.
       initialize_student_weights: a boolean, if true then initialize any
@@ -1667,6 +1736,7 @@ class StudentTeacher(object):
     self.teacher = teacher
     self.temperature = temperature
     self.fraction_soft = fraction_soft
+    self.distill_start_step = distill_start_step
     self.teacher_checkpoint = teacher_checkpoint
     self.initialize_student_weights = initialize_student_weights
 
@@ -1741,9 +1811,15 @@ class StudentTeacher(object):
     weights = mtf.cast(mtf.greater(targets, 0), soft_loss.dtype)
     soft_loss = (mtf.reduce_sum(soft_loss * weights) /
                  self.student.loss_denominator(targets, num_microbatches))
+    global_step = tf.train.get_or_create_global_step()
+    current_fraction_soft = tf.cast(
+        tf.cond(
+            tf.math.greater(global_step, self.distill_start_step),
+            lambda: self.fraction_soft, lambda: tf.constant(0.0)),
+        dtype=soft_loss.dtype)
 
-    loss = (1.0 - self.fraction_soft) * hard_loss \
-           + self.temperature**2 * self.fraction_soft * soft_loss
+    loss = ((1.0 - current_fraction_soft) * hard_loss +
+            self.temperature**2 * current_fraction_soft * soft_loss)
 
     return student_logits, loss
 

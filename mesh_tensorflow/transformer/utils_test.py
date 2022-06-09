@@ -1,5 +1,5 @@
 # coding=utf-8
-# Copyright 2021 The Mesh TensorFlow Authors.
+# Copyright 2022 The Mesh TensorFlow Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
+
 
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -122,36 +123,43 @@ class UtilsTest(parameterized.TestCase, tf.test.TestCase):
       ("int32", np.int32),
       ("int64", np.int64),
   )
-  def test_maybe_decode_python_with_int_inputs(self, dtype):
-    vocabulary = mock_vocabulary({
-        "a": 1,
-        "b": 2,
-        "c": 3,
-        "d": 4,
-    },
+  def test_maybe_add_pretokenized_features_with_int_inputs(self, dtype):
+    vocabulary = mock_vocabulary({"a": 1, "b": 2, "c": 3, "d": 4,},
                                  vocab_size=1000)
-    ids_or_strs = [np.array([1, 2, 3, 4], dtype=np.int32)]
-    result = utils._maybe_decode_python(ids_or_strs, vocabulary)
-    expected = [["a", "b", "c", "d"]]
-    self.assertAllEqual(result, expected)
 
-  @parameterized.named_parameters(
-      ("str", [["a", "b", "c", "d"]]),
-      ("bytes", [[b"a", b"b", b"c", b"d"]]),
-      ("ndarray_str", [np.array(["a", "b", "c", "d"])]),
-      ("ndarray_bytes", [np.array([b"a", b"b", b"c", b"d"])]),
-  )
-  def test_maybe_decode_python_with_str_inputs(self, ids_or_strs):
-    vocabulary = mock_vocabulary({
-        "a": 1,
-        "b": 2,
-        "c": 3,
-        "d": 4,
-    },
+    examples = [{"targets": np.array([1, 2, 3, 4], dtype=dtype),
+                 "inputs": np.array([1, 2, 3, 4], dtype=dtype)},
+                ]
+    result = utils._maybe_add_pretokenized_features(examples, vocabulary)
+    expected = ["a", "b", "c", "d"]
+    self.assertAllEqual(result[0]["targets_pretokenized"], expected)
+    self.assertAllEqual(result[0]["inputs_pretokenized"], expected)
+    self.assertLen(result, 1)
+
+  def test_maybe_add_pretokenized_features_nonstandard_feature(self):
+    vocabulary = mock_vocabulary({"a": 1, "b": 2, "c": 3, "d": 4,},
                                  vocab_size=1000)
-    result = utils._maybe_decode_python(ids_or_strs, vocabulary)
-    expected = [["a", "b", "c", "d"]]
-    self.assertAllEqual(result, expected)
+
+    examples = [{"notafeature": np.array([1, 2, 3, 4], dtype=np.int32),
+                 "inputs": np.array([1, 2, 3, 4], dtype=np.int32)}
+                ]
+    result = utils._maybe_add_pretokenized_features(examples, vocabulary)
+
+    self.assertSameElements(result[0].keys(),
+                            ("notafeature", "inputs", "inputs_pretokenized"))
+    self.assertAllEqual(result[0]["notafeature"], [1, 2, 3, 4])
+
+  def test_maybe_add_pretokenized_features_pretokenized_exists(self):
+    vocabulary = mock_vocabulary({"a": 1, "b": 2, "c": 3, "d": 4,},
+                                 vocab_size=1000)
+
+    examples = [{"inputs_pretokenized": "Hello world!",
+                 "inputs": np.array([1, 2, 3, 4], dtype=np.int32)}
+                ]
+    result = utils._maybe_add_pretokenized_features(examples, vocabulary)
+    self.assertEqual(result[0]["inputs_pretokenized"], "Hello world!")
+    self.assertSameElements(result[0].keys(), ("inputs", "inputs_pretokenized"))
+    self.assertLen(result, 1)
 
 
 if __name__ == "__main__":
