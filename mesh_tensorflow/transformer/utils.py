@@ -1361,7 +1361,7 @@ def decode(estimator,
     output_string = _maybe_detokenize(
         result["outputs"], targets_vocabulary(vocabulary))
     scores = result["scores"][0]
-    scores = scores[monot5_true_false_tokens].tolist()
+    scores = scores[monot5_false_true_tokens].tolist()
     # scores = scores[[6136, 1176]].tolist()
     scores = [float(score) for score in scores]
     probs = torch.nn.functional.log_softmax(torch.from_numpy(np.array(scores)))
