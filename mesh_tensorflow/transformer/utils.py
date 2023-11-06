@@ -1355,6 +1355,10 @@ def decode(estimator,
       return value
     return vocab.decode([int(x) for x in value])
 
+  # log the monot5 false/true token ids
+  tf.logging.info("monot5_false_true_token_ids: %s",
+                  monot5_false_true_token_ids)
+
   for i, result in enumerate(result_iter):
     input_string = _maybe_detokenize(
         result["inputs"], inputs_vocabulary(vocabulary))
@@ -1516,6 +1520,10 @@ def decode_from_file(estimator,
                                        monot5_false_true_tokens)
   assert len(false_token_id) == len(true_token_id) == 1
   false_token_id, true_token_id = false_token_id[0], true_token_id[0]
+  # log tokens and token_ids
+  tf.logging.info("mono5_false_true_tokens: %s", monot5_false_true_tokens)
+  tf.logging.info("false_token_id: %s", false_token_id)
+  tf.logging.info("true_token_id: %s", true_token_id)
 
   checkpoint_step = get_step_from_checkpoint_path(checkpoint_path)
   decodes = list(decode(
