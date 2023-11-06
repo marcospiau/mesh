@@ -1326,12 +1326,12 @@ def encode_delimited_lm(inputs,
   return all_ids
 
 
-@gin.configurable
+@gin.configurable(denylist=['monot5_false_true_token_ids'])
 def decode(estimator,
            input_fn,
            vocabulary,
            checkpoint_path=None,
-           monot5_false_true_tokens=[6136, 1176]):
+           monot5_false_true_token_ids=[6136, 1176]):
   """Decode from an input_fn.
 
   Args:
@@ -1340,7 +1340,7 @@ def decode(estimator,
     vocabulary: a vocabulary.Vocabulary or (inputs_vocabulary,
       targets_vocabulary) tuple
     checkpoint_path: an optional string
-    monot5_false_true_tokens: a list of ints corresponding to the monot5
+    monot5_false_true_token_ids: a list of ints corresponding to the monot5
       false/true tokens. Defaults to [6136, 1176] which are the tokens for
       "false" and "true" using the default T5 vocabulary.
 
@@ -1361,7 +1361,7 @@ def decode(estimator,
     output_string = _maybe_detokenize(
         result["outputs"], targets_vocabulary(vocabulary))
     scores = result["scores"][0]
-    scores = scores[monot5_false_true_tokens].tolist()
+    scores = scores[monot5_false_true_token_ids].tolist()
     # scores = scores[[6136, 1176]].tolist()
     scores = [float(score) for score in scores]
     probs = torch.nn.functional.log_softmax(torch.from_numpy(np.array(scores)))
@@ -1479,7 +1479,8 @@ def decode_from_file(estimator,
                      input_filename=gin.REQUIRED,
                      output_filename=gin.REQUIRED,
                      eos_id=1,
-                     repeats=1):
+                     repeats=1,
+                     monot5_false_true_tokens=["true", "false"]):
   """Decode from a text file and write to output_filename.
 
   Args:
@@ -1494,6 +1495,8 @@ def decode_from_file(estimator,
     output_filename: a string
     eos_id: EOS id
     repeats: an integer, the number of times to repeat each input.
+    monot5_false_true_tokens: a list of strings corresponding to the monot5
+    false/true tokens. Defaults to ["true", "false"].
   """
   inputs = get_inputs_from_file(input_filename)
 
@@ -1508,9 +1511,16 @@ def decode_from_file(estimator,
     dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
     return dataset
 
+  # getting False and True token ids for monot5
+  false_token_id,  true_token_id = map(vocabulary.encode,
+                                       monot5_false_true_tokens)
+  assert len(false_token_id) == len(true_token_id) == 1
+  false_token_id, true_token_id = false_token_id[0], true_token_id[0]
+
   checkpoint_step = get_step_from_checkpoint_path(checkpoint_path)
   decodes = list(decode(
-      estimator, input_fn, vocabulary, checkpoint_path=checkpoint_path))
+      estimator, input_fn, vocabulary, checkpoint_path=checkpoint_path,
+      monot5_false_true_token_ids=[false_token_id, true_token_id]))
   # Remove any padded examples
   dataset_size = len(inputs) * repeats
   decodes = decodes[:dataset_size]
@@ -1530,7 +1540,7 @@ def decode_from_files(
     output_filenames=gin.REQUIRED,
     eos_id=1,
     repeats=1,
-):
+    monot5_false_true_tokens=["true", "false"]):
   """Decodes from multiple files and writes to output_filenames."""
   if len(input_filenames) != len(output_filenames):
     raise ValueError("Input and output filename lists must have equal length.")
@@ -1544,7 +1554,8 @@ def decode_from_files(
                      input_filename=input_filename,
                      output_filename=output_filename,
                      eos_id=eos_id,
-                     repeats=repeats)
+                     repeats=repeats,
+                      monot5_false_true_tokens=monot5_false_true_tokens)
 
 
 @gin.configurable
