@@ -1330,7 +1330,8 @@ def encode_delimited_lm(inputs,
 def decode(estimator,
            input_fn,
            vocabulary,
-           checkpoint_path=None):
+           checkpoint_path=None,
+           monot5_false_true_tokens=[6136, 1176]):
   """Decode from an input_fn.
 
   Args:
@@ -1339,6 +1340,9 @@ def decode(estimator,
     vocabulary: a vocabulary.Vocabulary or (inputs_vocabulary,
       targets_vocabulary) tuple
     checkpoint_path: an optional string
+    monot5_false_true_tokens: a list of ints corresponding to the monot5
+      false/true tokens. Defaults to [6136, 1176] which are the tokens for
+      "false" and "true" using the default T5 vocabulary.
 
   Yields:
     decoded strings
@@ -1357,7 +1361,8 @@ def decode(estimator,
     output_string = _maybe_detokenize(
         result["outputs"], targets_vocabulary(vocabulary))
     scores = result["scores"][0]
-    scores = scores[[6136, 1176]].tolist()
+    scores = scores[monot5_true_false_tokens].tolist()
+    # scores = scores[[6136, 1176]].tolist()
     scores = [float(score) for score in scores]
     probs = torch.nn.functional.log_softmax(torch.from_numpy(np.array(scores)))
     score_string = probs.tolist()[1]
