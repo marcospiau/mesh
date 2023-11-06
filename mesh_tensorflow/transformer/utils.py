@@ -1514,6 +1514,35 @@ def decode_from_file(estimator,
 
 
 @gin.configurable
+def decode_from_files(
+    estimator,
+    vocabulary,
+    model_type,
+    batch_size,
+    sequence_length,
+    checkpoint_path=None,
+    input_filenames=gin.REQUIRED,
+    output_filenames=gin.REQUIRED,
+    eos_id=1,
+    repeats=1,
+):
+  """Decodes from multiple files and writes to output_filenames."""
+  if len(input_filenames) != len(output_filenames):
+    raise ValueError("Input and output filename lists must have equal length.")
+  for input_filename, output_filename in zip(input_filenames, output_filenames):
+    decode_from_file(estimator=estimator,
+                     vocabulary=vocabulary,
+                     model_type=model_type,
+                     batch_size=batch_size,
+                     sequence_length=sequence_length,
+                     checkpoint_path=checkpoint_path,
+                     input_filename=input_filename,
+                     output_filename=output_filename,
+                     eos_id=eos_id,
+                     repeats=repeats)
+
+
+@gin.configurable
 def decode_from_dataset(estimator,
                         vocabulary,
                         model_type,
@@ -1881,7 +1910,7 @@ def score_from_strings(estimator, vocabulary, model_type, batch_size,
   evenly divide targets N times, where each input has N decodes sequentially
   in targets.
 
-  The function returns a list of floats represnenting the log-liekelihood of the
+  The function returns a list of floats representing the log-likelihood of the
   target given the input.  If `scores_filename` is present, then these are also
   written out as a text file, one per line.
 
