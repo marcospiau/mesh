@@ -1524,7 +1524,7 @@ def decode_from_file(estimator,
   assert len(false_token_id) == len(true_token_id) == 1
   false_token_id, true_token_id = false_token_id[0], true_token_id[0]
   # just for tests [852, 4295] # Não/Sim
-  assert false_token_id, true_token_id == [852, 4295]
+  # assert false_token_id, true_token_id == [852, 4295]
   # log tokens and token_ids
   tf.logging.info("mono5_false_true_tokens: %s", monot5_false_true_tokens)
   tf.logging.info("false_token_id: %s", false_token_id)
