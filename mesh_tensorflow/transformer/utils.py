@@ -1484,7 +1484,7 @@ def decode_from_file(estimator,
                      output_filename=gin.REQUIRED,
                      eos_id=1,
                      repeats=1,
-                     monot5_false_true_tokens=["true", "false"]):
+                     monot5_false_true_tokens=["false", "true"]):
   """Decode from a text file and write to output_filename.
 
   Args:
@@ -1553,7 +1553,7 @@ def decode_from_files(
     output_filenames=gin.REQUIRED,
     eos_id=1,
     repeats=1,
-    monot5_false_true_tokens=["true", "false"]):
+    monot5_false_true_tokens=["false", "true"]):
   """Decodes from multiple files and writes to output_filenames."""
   if len(input_filenames) != len(output_filenames):
     raise ValueError("Input and output filename lists must have equal length.")
